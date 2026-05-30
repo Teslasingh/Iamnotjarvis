@@ -1,0 +1,7 @@
+# Install once (no venv): python3 -m pip install --user -r requirements.txt
+fastapi
+uvicorn
+websockets
+httpx
+python-dotenv
+python-multipart
