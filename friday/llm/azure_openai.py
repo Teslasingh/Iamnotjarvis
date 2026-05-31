@@ -33,6 +33,16 @@ class AzureOpenAILLM:
             "Content-Type": "application/json",
         }
 
+    def _supports_custom_temperature(self) -> bool:
+        """GPT-5 and o-series deployments only accept the default temperature (1)."""
+        name = self.settings.azure_openai_deployment_name.lower()
+        if "gpt-5" in name:
+            return False
+        for series in ("o1", "o3", "o4"):
+            if name.startswith(series) or f"-{series}" in name:
+                return False
+        return True
+
     def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with httpx.Client(timeout=float(self.settings.llm_timeout_seconds)) as client:
             resp = client.post(self._url(), headers=self._headers(), json=payload)
@@ -53,7 +63,9 @@ class AzureOpenAILLM:
         return self._post(payload)["choices"][0]["message"]
 
     def chat(self, messages: List[Dict[str, Any]], *, temperature: float = 0.2) -> str:
-        payload: Dict[str, Any] = {"messages": messages, "temperature": temperature}
+        payload: Dict[str, Any] = {"messages": messages}
+        if self._supports_custom_temperature():
+            payload["temperature"] = temperature
         content = self._post(payload)["choices"][0]["message"].get("content") or ""
         return str(content).strip()
 
