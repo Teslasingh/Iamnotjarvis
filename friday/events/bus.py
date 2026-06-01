@@ -5,7 +5,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Set
+from typing import Any, Deque, Dict, List, Optional, Set
 
 
 def _now_iso() -> str:
@@ -17,6 +17,8 @@ class EventBus:
     """In-memory pub/sub with a bounded ring of recent events for late subscribers."""
 
     ring_max: int = 500
+    hook_runner: Any = field(default=None, repr=False)
+    hooks_enabled: bool = False
     _subscribers: Set[asyncio.Queue] = field(default_factory=set, repr=False)
     _ring: Deque[Dict[str, Any]] = field(init=False, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -41,6 +43,11 @@ class EventBus:
                 dead.append(q)
         for q in dead:
             self._subscribers.discard(q)
+        if self.hooks_enabled and self.hook_runner:
+            try:
+                await self.hook_runner.dispatch_gateway(event)
+            except Exception:
+                pass
 
     def subscribe(self, maxsize: int = 256) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)

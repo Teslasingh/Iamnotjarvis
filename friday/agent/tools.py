@@ -6,6 +6,9 @@ import platform
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
+import asyncio
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from html import unescape
@@ -17,7 +20,11 @@ import httpx
 
 from friday.config import Settings
 from friday.events.bus import EventBus
+from friday.agent.checkpoints import CheckpointManager
+from friday.agent.persistent_memory import PersistentMemoryStore, mirror_remember_soul
+from friday.agent.skills import SkillEntry, load_skill_body
 from friday.agent.soul import SoulStore
+from friday.llm.usage import TokenUsageStore
 from friday.runtime.files import (
     FileRegistry,
     guess_mime,
@@ -44,8 +51,15 @@ class ToolContext:
     settings: Settings
     file_registry: Optional[FileRegistry] = None
     soul_store: Optional[SoulStore] = None
+    usage_store: Optional[TokenUsageStore] = None
     client_id: Optional[str] = None
     delivered_outputs: List[Dict[str, Any]] = field(default_factory=list)
+    checkpoint_manager: Optional[CheckpointManager] = None
+    skills: Optional[Dict[str, SkillEntry]] = None
+    persistent_memory: Optional[PersistentMemoryStore] = None
+    hook_runner: Any = None
+    delegate_runner: Any = None
+    code_exec_runner: Any = None
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -380,11 +394,86 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_code",
+            "description": (
+                "Search for text or regex in the Iamnotjarvis repository (friday_repo_root from get_system_info). "
+                "Returns matching file paths, line numbers, and line snippets. Use before editing repo source."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Plain text or regex pattern to search"},
+                    "path": {
+                        "type": "string",
+                        "description": "Optional subdirectory under friday_repo_root; defaults to repo root",
+                    },
+                    "regex": {"type": "boolean", "description": "Treat query as regex, default false"},
+                    "max_results": {"type": "integer", "description": "Maximum matches to return, default 30"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_python",
+            "description": (
+                "Run python -m py_compile on one or more .py files to verify syntax after repo edits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Python file paths to validate",
+                    }
+                },
+                "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_token_usage",
+            "description": (
+                "Return Azure OpenAI token usage totals. Use when the user asks about tokens, usage, or cost. "
+                "Do not guess — call this tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "last_turn, session, or lifetime; default last_turn",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_friday",
+            "description": (
+                "Restart the Friday server process after editing friday/*.py. "
+                "Only works when FRIDAY_SELF_RESTART_ENABLED=true. Use after validation passes."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "remember_soul",
             "description": (
                 "Save a durable preference, behavior, learning, environment note, or self-modification record to soul.md "
-                "(persistent long-term memory). Use section 'self' for applied source changes requiring restart. "
-                "Use when the user asks to remember something or when a standing instruction should persist across sessions. "
+                "(persistent long-term memory). Use section 'learnings' for mistakes to avoid and fixes that worked. "
+                "Use section 'self' for applied source changes requiring restart. "
+                "Use when the user asks to remember something, when a standing instruction should persist across sessions, "
+                "or after diagnosing and fixing a failure so future turns avoid the same error. "
                 "Do not store secrets or one-off task details."
             ),
             "parameters": {
@@ -397,6 +486,72 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": (
+                "Load full instructions for an agentskills.io skill by name. "
+                "Call when the task matches a skill in the catalog before acting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name from the catalog"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Spawn parallel sub-agents with isolated context and restricted toolsets. "
+                "Each task needs a prompt; optional role (explore, verify, delegate) and toolsets list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "role": {"type": "string"},
+                                "toolsets": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                    "share_context": {
+                        "type": "boolean",
+                        "description": "Share parent turn summary with each child",
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": (
+                "Run a short Python script in a sandboxed subprocess (CODE_EXEC_ENABLED). "
+                "Use for multi-step tool workflows collapsed into one turn when enabled."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python source to execute"},
+                },
+                "required": ["code"],
             },
         },
     },
@@ -445,6 +600,102 @@ def _friday_paths() -> Dict[str, Optional[str]]:
         "friday_package_dir": str(package_dir),
         "friday_repo_root": str(repo_root) if repo_root else None,
     }
+
+
+_SKIP_SEARCH_DIRS = {".git", "__pycache__", ".friday", "node_modules", ".venv", "venv"}
+
+
+def _normalize_text_for_match(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _repo_edit_meta(path: Path) -> Dict[str, Any]:
+    paths = _friday_paths()
+    repo_root = paths.get("friday_repo_root")
+    package_dir = paths.get("friday_package_dir")
+    under_repo = bool(repo_root and is_path_under(Path(repo_root), path))
+    requires_restart = False
+    if package_dir and path.suffix.lower() == ".py":
+        try:
+            requires_restart = is_path_under(Path(package_dir), path)
+        except ValueError:
+            requires_restart = False
+    validation_hint = None
+    if path.suffix.lower() == ".py":
+        validation_hint = f'python -m py_compile "{path}"'
+    return {
+        "under_friday_repo": under_repo,
+        "requires_restart": requires_restart,
+        "validation_hint": validation_hint,
+    }
+
+
+def _search_code_in_repo(
+    repo_root: Path,
+    query: str,
+    *,
+    subpath: Optional[str] = None,
+    regex: bool = False,
+    max_results: int = 30,
+) -> List[Dict[str, Any]]:
+    root = repo_root
+    if subpath:
+        root = (repo_root / subpath).resolve()
+        if not is_path_under(repo_root, root):
+            return []
+    pattern = re.compile(query) if regex else None
+    matches: List[Dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_SEARCH_DIRS]
+        for filename in filenames:
+            if len(matches) >= max_results:
+                return matches
+            file_path = Path(dirpath) / filename
+            if file_path.suffix.lower() not in {
+                ".py",
+                ".md",
+                ".txt",
+                ".json",
+                ".yaml",
+                ".yml",
+                ".html",
+                ".js",
+                ".css",
+                ".toml",
+                ".env",
+            }:
+                continue
+            try:
+                lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line_no, line in enumerate(lines, 1):
+                if regex:
+                    if not pattern or not pattern.search(line):
+                        continue
+                elif query not in line:
+                    continue
+                matches.append(
+                    {
+                        "path": str(file_path),
+                        "line": line_no,
+                        "snippet": line.strip()[:200],
+                    }
+                )
+                if len(matches) >= max_results:
+                    return matches
+    return matches
+
+
+def _replace_not_found_hint(text: str, old: str) -> Optional[str]:
+    normalized = _normalize_text_for_match(text)
+    old_norm = _normalize_text_for_match(old)
+    idx = normalized.find(old_norm[: min(40, len(old_norm))])
+    if idx < 0:
+        return None
+    start = max(0, idx - 80)
+    end = min(len(normalized), idx + 120)
+    return normalized[start:end]
 
 
 def _strip_html(html_text: str) -> str:
@@ -557,8 +808,17 @@ def _path_suggestions(target: Path, kind: str, max_suggestions: int) -> List[Dic
     ]
 
 
+async def _maybe_checkpoint(ctx: ToolContext, tool: str, path: Path) -> None:
+    if ctx.checkpoint_manager and ctx.settings.checkpoints_enabled and path.is_file():
+        ctx.checkpoint_manager.snapshot_before(tool, [path])
+
+
 async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> str:
     await ctx.bus.publish({"type": "tool_call", "tool": name, "args": arguments})
+    if ctx.hook_runner:
+        deny = await ctx.hook_runner.before_tool_call(name, arguments)
+        if deny:
+            return json.dumps({"error": "hook_denied", "message": deny})
 
     if name == "run_shell":
         if not ctx.allow_shell:
@@ -691,6 +951,7 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
 
     if name == "write_file":
         path = _resolve_path(ctx.workdir, str(arguments.get("path", "")))
+        await _maybe_checkpoint(ctx, "write_file", path)
         content = str(arguments.get("content", ""))
         workdir = Path(ctx.workdir).resolve()
         try:
@@ -701,8 +962,15 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
                 path.write_text(content, encoding="utf-8")
                 byte_count = len(content.encode("utf-8"))
             rel = workdir_relative(workdir, path)
+            meta = _repo_edit_meta(path.resolve())
             return json.dumps(
-                {"ok": True, "path": rel, "absolute_path": str(path.resolve()), "bytes": byte_count},
+                {
+                    "ok": True,
+                    "path": rel,
+                    "absolute_path": str(path.resolve()),
+                    "bytes": byte_count,
+                    **meta,
+                },
                 ensure_ascii=False,
             )
         except OSError as exc:
@@ -710,24 +978,34 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
 
     if name == "replace_in_file":
         path = _resolve_path(ctx.workdir, str(arguments.get("path", "")))
+        await _maybe_checkpoint(ctx, "replace_in_file", path)
         old = str(arguments.get("old", ""))
         new = str(arguments.get("new", ""))
         count = _as_int(arguments.get("count"), 1, minimum=0, maximum=1_000_000)
         if not old:
             return json.dumps({"error": "old text must not be empty"})
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            occurrences = text.count(old)
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+            text = _normalize_text_for_match(raw_text)
+            old_norm = _normalize_text_for_match(old)
+            new_norm = _normalize_text_for_match(new)
+            occurrences = text.count(old_norm)
             if occurrences == 0:
-                return json.dumps({"error": "old text not found", "path": str(path)})
-            replaced = text.replace(old, new) if count == 0 else text.replace(old, new, count)
+                hint = _replace_not_found_hint(raw_text, old)
+                payload: Dict[str, Any] = {"error": "old text not found", "path": str(path)}
+                if hint:
+                    payload["nearby_context"] = hint
+                return json.dumps(payload)
+            replaced = text.replace(old_norm, new_norm) if count == 0 else text.replace(old_norm, new_norm, count)
             path.write_text(replaced, encoding="utf-8")
+            meta = _repo_edit_meta(path.resolve())
             return json.dumps(
                 {
                     "ok": True,
                     "path": str(path),
                     "occurrences_found": occurrences,
                     "occurrences_replaced": occurrences if count == 0 else min(count, occurrences),
+                    **meta,
                 }
             )
         except OSError as exc:
@@ -778,6 +1056,8 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
     if name == "move_path":
         workdir = Path(ctx.workdir).resolve()
         src = _resolve_path(ctx.workdir, str(arguments.get("source", "")))
+        if src.is_file():
+            await _maybe_checkpoint(ctx, "move_path", src)
         dest = _resolve_path(ctx.workdir, str(arguments.get("destination", "")))
         overwrite = bool(arguments.get("overwrite", False))
         try:
@@ -806,6 +1086,8 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
     if name == "delete_path":
         workdir = Path(ctx.workdir).resolve()
         path = _resolve_path(ctx.workdir, str(arguments.get("path", "")))
+        if path.is_file():
+            await _maybe_checkpoint(ctx, "delete_path", path)
         recursive = bool(arguments.get("recursive", False))
         try:
             rel = workdir_relative(workdir, path)
@@ -856,6 +1138,116 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
         if ctx.soul_store:
             info["soul_path"] = str(ctx.soul_store.path)
         return json.dumps(info)
+
+    if name == "search_code":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return json.dumps({"error": "empty query"})
+        paths = _friday_paths()
+        repo_root = paths.get("friday_repo_root")
+        if not repo_root:
+            return json.dumps({"error": "friday_repo_root not found"})
+        subpath = str(arguments.get("path") or "").strip() or None
+        regex = bool(arguments.get("regex", False))
+        max_results = _as_int(arguments.get("max_results"), 30, maximum=100)
+        try:
+            matches = _search_code_in_repo(
+                Path(repo_root),
+                query,
+                subpath=subpath,
+                regex=regex,
+                max_results=max_results,
+            )
+            return json.dumps(
+                {
+                    "repo_root": repo_root,
+                    "query": query,
+                    "match_count": len(matches),
+                    "matches": matches,
+                },
+                ensure_ascii=False,
+            )
+        except re.error as exc:
+            return json.dumps({"error": f"invalid regex: {exc}"})
+
+    if name == "validate_python":
+        raw_paths = arguments.get("paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            return json.dumps({"error": "paths must be a non-empty array"})
+        results: List[Dict[str, Any]] = []
+        all_ok = True
+        for raw in raw_paths[:20]:
+            path = _resolve_path(ctx.workdir, str(raw))
+            if path.suffix.lower() != ".py":
+                results.append({"path": str(path), "ok": False, "error": "not a .py file"})
+                all_ok = False
+                continue
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(path)],
+                capture_output=True,
+                text=True,
+            )
+            ok = proc.returncode == 0
+            if not ok:
+                all_ok = False
+            results.append(
+                {
+                    "path": str(path),
+                    "ok": ok,
+                    "stderr": (proc.stderr or proc.stdout or "").strip()[:2000],
+                }
+            )
+        return json.dumps({"ok": all_ok, "results": results}, ensure_ascii=False)
+
+    if name == "get_token_usage":
+        if not ctx.settings.token_usage_enabled:
+            return json.dumps({"error": "token usage tracking disabled"})
+        if not ctx.usage_store:
+            return json.dumps({"error": "token usage store unavailable"})
+        scope = str(arguments.get("scope") or "last_turn").strip().lower()
+        if scope not in {"last_turn", "session", "lifetime"}:
+            scope = "last_turn"
+        snapshot = ctx.usage_store.snapshot(scope)
+        totals = snapshot.get("totals") or {}
+        summary = (
+            f"scope={snapshot.get('scope')}: "
+            f"prompt={totals.get('prompt_tokens', 0)}, "
+            f"completion={totals.get('completion_tokens', 0)}, "
+            f"total={totals.get('total_tokens', 0)}"
+        )
+        snapshot["summary"] = summary
+        return json.dumps(snapshot, ensure_ascii=False)
+
+    if name == "restart_friday":
+        if not ctx.settings.friday_self_restart_enabled:
+            return json.dumps(
+                {
+                    "error": "self restart disabled",
+                    "hint": "Set FRIDAY_SELF_RESTART_ENABLED=true to enable restart_friday",
+                }
+            )
+        if not ctx.allow_shell:
+            return json.dumps({"error": "shell execution disabled by policy"})
+        cwd = ctx.workdir or os.getcwd()
+        subprocess.Popen(
+            [sys.executable, "-m", "friday"],
+            cwd=cwd,
+            env=os.environ.copy(),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0,
+        )
+
+        async def _delayed_exit() -> None:
+            await asyncio.sleep(1.5)
+            os._exit(0)
+
+        asyncio.create_task(_delayed_exit())
+        return json.dumps(
+            {
+                "ok": True,
+                "message": "Friday restart scheduled; this process will exit shortly.",
+                "cwd": cwd,
+            }
+        )
 
     if name == "web_search":
         query = str(arguments.get("query", "")).strip()
@@ -951,6 +1343,8 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
         ok = ctx.soul_store.append_bullet(section, text)
         if not ok:
             return json.dumps({"error": "failed to save soul memory"})
+        if ctx.persistent_memory:
+            mirror_remember_soul(section, text, ctx.persistent_memory)
         await ctx.bus.publish({"type": "soul_updated", "source": "remember_soul", "client_id": ctx.client_id})
         return json.dumps(
             {
@@ -961,5 +1355,39 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
             },
             ensure_ascii=False,
         )
+
+    if name == "load_skill":
+        if not ctx.settings.skills_enabled:
+            return json.dumps({"error": "skills disabled"})
+        skill_name = str(arguments.get("name", "")).strip().lower()
+        registry = ctx.skills or {}
+        entry = registry.get(skill_name)
+        if not entry:
+            return json.dumps({"error": f"skill not found: {skill_name}"})
+        body = load_skill_body(entry, ctx.settings.skill_max_chars)
+        return json.dumps(
+            {
+                "name": entry.name,
+                "description": entry.description,
+                "instructions": body,
+                "skill_dir": str(entry.skill_dir),
+            },
+            ensure_ascii=False,
+        )
+
+    if name == "delegate_task":
+        if not ctx.delegate_runner:
+            return json.dumps({"error": "delegation unavailable"})
+        tasks = arguments.get("tasks")
+        if not isinstance(tasks, list):
+            return json.dumps({"error": "tasks must be a list"})
+        share = bool(arguments.get("share_context", False))
+        return await ctx.delegate_runner(tasks, share_context=share)
+
+    if name == "execute_code":
+        if not ctx.code_exec_runner:
+            return json.dumps({"error": "execute_code unavailable"})
+        code = str(arguments.get("code", ""))
+        return await ctx.code_exec_runner(code)
 
     return json.dumps({"error": f"unknown tool {name}"})

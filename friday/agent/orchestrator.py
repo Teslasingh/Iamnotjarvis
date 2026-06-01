@@ -6,6 +6,8 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 from friday.agent.loop import run_agent_turn
+from friday.agent.turn_context import AgentExtras
+from friday.agent.mistakes import TurnMistakeLog
 from friday.agent.soul import SoulStore
 from friday.config import Settings
 from friday.events.bus import EventBus
@@ -80,6 +82,7 @@ async def _run_subagent(
     *,
     subtask: Dict[str, str],
     index: int,
+    extra_kw: Optional[Dict[str, Any]] = None,
     user_message: str,
     expanded_query: str,
     task_brief: str,
@@ -98,7 +101,8 @@ async def _run_subagent(
     soul_store: Optional[SoulStore],
     client_id: Optional[str],
     retry_context: str = "",
-) -> Tuple[str, List[Dict[str, Any]], bool]:
+) -> Tuple[str, List[Dict[str, Any]], bool, TurnMistakeLog]:
+    kw = extra_kw or {}
     role = subtask.get("role", "execute")
     goal = subtask.get("goal", expanded_query)
     role_prompt = _ROLE_PROMPTS.get(role, _ROLE_PROMPTS["execute"])
@@ -117,7 +121,7 @@ async def _run_subagent(
     )
 
     sub_message = f"{expanded_query}\n\nSub-task ({role}): {goal}"
-    reply, outputs = await run_agent_turn(
+    reply, outputs, mistakes = await run_agent_turn(
         user_message,
         llm=llm,
         bus=bus,
@@ -139,6 +143,8 @@ async def _run_subagent(
         prior_agent_context=prior_context,
         skip_expansion=True,
         max_steps_override=settings.multi_agent_subagent_max_steps,
+        role=role if role in {"explore", "execute", "verify"} else "execute",
+        **kw,
     )
 
     failed = _subagent_failed(reply)
@@ -151,7 +157,7 @@ async def _run_subagent(
             "client_id": client_id,
         }
     )
-    return reply, outputs, failed
+    return reply, outputs, failed, mistakes
 
 
 async def _synthesize_reply(
@@ -185,7 +191,7 @@ async def _synthesize_reply(
         return await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                partial(llm.chat, messages=messages, temperature=0.2),
+                partial(llm.chat, messages=messages, temperature=0.2, source="orchestrator_synthesis"),
             ),
             timeout=max(10, min(60, settings.llm_timeout_seconds)),
         )
@@ -211,7 +217,9 @@ async def run_orchestrated_turn(
     file_registry: Optional[FileRegistry] = None,
     soul_store: Optional[SoulStore] = None,
     client_id: Optional[str] = None,
-) -> Tuple[str, List[Dict[str, Any]]]:
+    agent_extras: Optional[AgentExtras] = None,
+) -> Tuple[str, List[Dict[str, Any]], TurnMistakeLog]:
+    extra_kw = agent_extras.as_kwargs() if agent_extras else {}
     analysis = await analyze_task(
         user_message,
         llm=llm,
@@ -248,6 +256,7 @@ async def run_orchestrated_turn(
             effective_message=expanded_query,
             task_brief=task_brief,
             skip_expansion=True,
+            **extra_kw,
         )
 
     await bus.publish(
@@ -262,11 +271,13 @@ async def run_orchestrated_turn(
     prior_context = ""
     reports: List[Dict[str, Any]] = []
     all_outputs: List[List[Dict[str, Any]]] = []
+    turn_mistakes = TurnMistakeLog()
 
     for index, subtask in enumerate(subtasks):
-        reply, outputs, failed = await _run_subagent(
+        reply, outputs, failed, mistakes = await _run_subagent(
             subtask=subtask,
             index=index,
+            extra_kw=extra_kw,
             user_message=user_message,
             expanded_query=expanded_query,
             task_brief=task_brief,
@@ -286,6 +297,10 @@ async def run_orchestrated_turn(
             client_id=client_id,
         )
 
+        turn_mistakes.merge(mistakes)
+        if mistakes.step_budget_exhausted:
+            turn_mistakes.step_budget_exhausted = True
+
         if failed:
             await bus.publish(
                 {
@@ -295,9 +310,10 @@ async def run_orchestrated_turn(
                     "client_id": client_id,
                 }
             )
-            reply, outputs, _ = await _run_subagent(
+            reply, outputs, _, retry_mistakes = await _run_subagent(
                 subtask=subtask,
                 index=index,
+                extra_kw=extra_kw,
                 user_message=user_message,
                 expanded_query=expanded_query,
                 task_brief=task_brief,
@@ -318,6 +334,10 @@ async def run_orchestrated_turn(
                 retry_context=reply,
             )
 
+            turn_mistakes.merge(retry_mistakes)
+            if retry_mistakes.step_budget_exhausted:
+                turn_mistakes.step_budget_exhausted = True
+
         role = subtask.get("role", "execute")
         goal = subtask.get("goal", "")
         reports.append({"role": role, "goal": goal, "reply": reply})
@@ -334,4 +354,4 @@ async def run_orchestrated_turn(
             "client_id": client_id,
         }
     )
-    return final_reply.strip() or "Task completed.", merged_outputs
+    return final_reply.strip() or "Task completed.", merged_outputs, turn_mistakes

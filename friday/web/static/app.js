@@ -10,6 +10,7 @@ const attachmentChips = $("#attachment-chips");
 const statusEl = $("#status");
 const clearLogBtn = $("#btn-clear-log");
 const clearJobsBtn = $("#btn-clear-jobs");
+const jobCountBadge = $("#job-count-badge");
 
 const pageClientId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 const jobs = new Map();
@@ -236,20 +237,48 @@ function connectEvents() {
       if (data.type === "orchestration_complete" && data.client_id === pageClientId) {
         setStatus("Synthesizing reply…");
       }
-      if (data.type === "chat_complete" && data.reply && data.client_id === pageClientId) {
-        if (liveOutputContainer && liveOutputContainer.isConnected) {
-          liveOutputContainer.remove();
+      if (data.type === "watchdog_job_stopped") {
+        setStatus("Watchdog stopped job");
+        hydrateJobsFromServer();
+      }
+      if (data.type === "autonomy_loop_broken") {
+        setStatus("Loop broken — stopped");
+        appendAgent(
+          `Stopped autonomous loop (${data.reason || "unknown"}).${
+            data.stall_count ? ` Repeated tool stalls: ${data.stall_count}.` : ""
+          }`,
+          [],
+          { autonomous: true, source: "watchdog" },
+        );
+      }
+      if (data.type === "autonomy_task_started") {
+        const label = data.source || "task";
+        setStatus(data.proactive ? `Autonomous (${label})…` : "Running…");
+      }
+      if (data.type === "autonomy_continuation") {
+        setStatus(`Continuing (${data.continuation_index || "?"})…`);
+      }
+      if (data.type === "chat_complete" && data.reply) {
+        const showReply =
+          data.client_id === pageClientId || data.autonomous || !data.client_id;
+        if (showReply) {
+          if (liveOutputContainer && liveOutputContainer.isConnected) {
+            liveOutputContainer.remove();
+          }
+          liveOutputContainer = null;
+          appendAgent(data.reply, data.outputs || [], {
+            autonomous: !!data.autonomous,
+            source: data.task_source,
+          });
+          setStatus("Idle");
         }
-        liveOutputContainer = null;
-        appendAgent(data.reply, data.outputs || []);
-        setStatus("Idle");
       }
       if (data.type === "output_ready" && data.client_id === pageClientId && data.output) {
         const block = ensureLiveOutputContainer();
         renderOutputItem(block, data.output);
         chatStream.scrollTop = chatStream.scrollHeight;
       }
-      if ((data.type === "chat_error" && data.client_id === pageClientId) || data.type === "llm_error") {
+      if ((data.type === "chat_error" && (data.client_id === pageClientId || data.autonomous)) || data.type === "llm_error") {
         setStatus("Error");
       }
       if (data.type === "assistant_delta" && data.text) {
@@ -269,9 +298,22 @@ function connectEvents() {
   };
 }
 
-async function appendAgent(text, outputs) {
+async function appendAgent(text, outputs, meta = {}) {
   const div = document.createElement("div");
   div.className = "msg agent";
+  if (meta.autonomous) {
+    div.classList.add("msg-autonomous");
+    const tag = document.createElement("div");
+    tag.className = "msg-tag";
+    const source = meta.source || "autonomous";
+    tag.textContent =
+      source === "job_followup"
+        ? "Job follow-up"
+        : source === "continuation"
+          ? "Continued"
+          : "Autonomous";
+    div.appendChild(tag);
+  }
   const body = document.createElement("div");
   body.className = "msg-text";
   body.textContent = text;
@@ -375,13 +417,26 @@ function toggleJobExpand(jobId) {
   renderJobs();
 }
 
+function updateJobCountBadge() {
+  if (!jobCountBadge) return;
+  const running = Array.from(jobs.values()).filter((job) => {
+    const status = job.status || "running";
+    return status === "running" || status === "stopping";
+  }).length;
+  const total = jobs.size;
+  if (!total) {
+    jobCountBadge.classList.add("hidden");
+    jobCountBadge.textContent = "";
+    return;
+  }
+  jobCountBadge.classList.remove("hidden");
+  jobCountBadge.textContent = running ? `${running} running` : `${total} job${total === 1 ? "" : "s"}`;
+}
+
 function renderJobs() {
+  updateJobCountBadge();
   jobList.innerHTML = "";
   if (!jobs.size) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "No shell jobs yet — start one from chat; background jobs persist across messages.";
-    jobList.appendChild(li);
     return;
   }
   const sorted = Array.from(jobs.values()).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
@@ -553,6 +608,11 @@ $("#chat-form").addEventListener("submit", async (e) => {
     if (!resp.ok) {
       setStatus("Error");
       appendAgent(`Request failed: ${resp.status}`);
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      if (data.queued) {
+        setStatus("Queued…");
+      }
     }
   } catch (exc) {
     setStatus("Error");
@@ -587,7 +647,10 @@ if (clearLogBtn) {
 }
 
 if (clearJobsBtn) {
-  clearJobsBtn.addEventListener("click", () => {
+  clearJobsBtn.addEventListener("click", async () => {
+    try {
+      await fetch("/api/jobs/clear", { method: "POST", credentials: "same-origin" });
+    } catch {}
     jobs.clear();
     expandedJobIds.clear();
     renderJobs();

@@ -7,6 +7,7 @@ import re
 from functools import partial
 from typing import Any, Dict, Optional
 
+from friday.agent.mistakes import TurnMistakeLog
 from friday.agent.soul import SoulStore
 from friday.config import Settings
 from friday.events.bus import EventBus
@@ -43,6 +44,7 @@ When updating:
 - merge new learnings into the existing file
 - deduplicate similar bullets
 - keep section headers: Preferences, Behaviors, Learnings, Environment, Self
+- put mistakes, failed approaches, and their fixes in Learnings — phrase as actionable rules ("Avoid X; use Y instead")
 - use Self for applied source customizations, pending restarts, or repo-specific paths
 - preserve still-relevant existing bullets
 - if nothing new is durable, return {"update": false}"""
@@ -53,13 +55,20 @@ _SKIP_PATTERNS = (
 )
 
 
-def _should_skip_update(user_message: str, assistant_reply: str, settings: Settings) -> Optional[str]:
+def _should_skip_update(
+    user_message: str,
+    assistant_reply: str,
+    settings: Settings,
+    mistake_log: Optional[TurnMistakeLog] = None,
+) -> Optional[str]:
     if not settings.soul_enabled or not settings.soul_auto_update:
         return "disabled"
     user = user_message.strip()
     assistant = assistant_reply.strip()
     if not user or not assistant:
         return "empty_turn"
+    if mistake_log and mistake_log.has_entries():
+        return None
     if len(user) + len(assistant) < 40:
         return "too_short"
     lowered = user.lower()
@@ -92,14 +101,22 @@ def _build_user_prompt(
     user_message: str,
     assistant_reply: str,
     max_file_chars: int,
+    mistake_log: Optional[TurnMistakeLog] = None,
 ) -> str:
     soul_excerpt = current_soul
     if len(soul_excerpt) > max_file_chars:
         soul_excerpt = soul_excerpt[: max_file_chars - 20].rstrip() + "\n[... truncated ...]"
+    mistakes_block = ""
+    if mistake_log and mistake_log.has_entries():
+        mistakes_block = (
+            "\n\nFailures during this turn (extract durable lessons — what went wrong and what fixed it):\n"
+            f"{mistake_log.format_for_soul()}\n"
+        )
     return (
         f"Current soul.md:\n{soul_excerpt}\n\n"
         f"User message:\n{user_message.strip()[:4000]}\n\n"
-        f"Assistant reply:\n{assistant_reply.strip()[:6000]}\n\n"
+        f"Assistant reply:\n{assistant_reply.strip()[:6000]}"
+        f"{mistakes_block}\n\n"
         "Return merged soul.md JSON if anything durable should be saved; otherwise {\"update\": false}."
     )
 
@@ -112,8 +129,9 @@ async def maybe_update_soul(
     user_message: str,
     assistant_reply: str,
     client_id: Optional[str] = None,
+    mistake_log: Optional[TurnMistakeLog] = None,
 ) -> None:
-    skip_reason = _should_skip_update(user_message, assistant_reply, settings)
+    skip_reason = _should_skip_update(user_message, assistant_reply, settings, mistake_log)
     if skip_reason:
         await bus.publish(
             {
@@ -134,6 +152,7 @@ async def maybe_update_soul(
                 user_message,
                 assistant_reply,
                 settings.soul_max_file_chars,
+                mistake_log=mistake_log,
             ),
         },
     ]
@@ -143,7 +162,7 @@ async def maybe_update_soul(
         raw = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                partial(llm.chat, messages=messages, temperature=0.1),
+                partial(llm.chat, messages=messages, temperature=0.1, source="soul_update"),
             ),
             timeout=max(10, min(60, settings.llm_timeout_seconds)),
         )

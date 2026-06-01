@@ -245,7 +245,7 @@ async def analyze_task(
         raw = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                partial(llm.chat, messages=messages, temperature=0.2),
+                partial(llm.chat, messages=messages, temperature=0.2, source="task_analysis"),
             ),
             timeout=max(10, min(60, settings.llm_timeout_seconds)),
         )

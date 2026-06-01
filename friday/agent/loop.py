@@ -4,9 +4,14 @@ import asyncio
 import json
 import logging
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401 — Any used by agent extras
 
-from friday.agent.tools import TOOL_DEFINITIONS, ToolContext, execute_tool
+from friday.agent.checkpoints import CheckpointManager
+from friday.agent.mistakes import TurnMistakeLog, record_tool_outcome, shell_run_failed
+from friday.agent.persistent_memory import PersistentMemoryStore
+from friday.agent.skills import SkillEntry
+from friday.agent.toolsets import resolve_tools
+from friday.agent.tools import ToolContext, execute_tool
 from friday.agent.soul import SoulStore
 from friday.config import Settings
 from friday.events.bus import EventBus
@@ -40,7 +45,7 @@ Communication style:
 
 You have host-level tools: run_shell, start_shell_job, stop_shell_job, get_shell_job, list_shell_jobs,
 read_file, write_file, write_output, replace_in_file, inspect_file, deliver_output, list_dir, resolve_path, move_path, delete_path, make_dir,
-get_system_info, web_search, http_request, sqlite_query, remember_soul.
+get_system_info, search_code, validate_python, get_token_usage, restart_friday, web_search, http_request, sqlite_query, remember_soul.
 They run on this machine with inherited environment variables (paths, conda, npm, SDKs, secrets-in-env — same visibility as Friday's process).
 
 Shell behavior (approximates your normal CLI; not a full interactive TTY):
@@ -63,24 +68,37 @@ Tool policy:
 - Prefer replace_in_file for small edits; write_file for new files or full rewrites.
 - Use web_search, http_request, sqlite_query appropriately.
 - Only delete paths when explicitly asked.
+- Use load_skill when a task matches a skill in the catalog; follow its instructions.
+- Use delegate_task for parallel isolated sub-agents when fan-out helps.
 - Use remember_soul when the user asks you to remember a preference, habit, or standing instruction.
+  Also call remember_soul (section learnings) after you diagnose and fix a mistake — capture root cause
+  and the working approach so future sessions avoid the same failure.
   Soul memory is curated long-term storage (soul.md), not a chat transcript — save durable facts only.
+
+Learning from mistakes:
+- Soul memory includes a Learnings section with past failures; read it every turn and do not repeat those errors.
+- When a command, path, tool choice, or edit fails then you recover, save the lesson via remember_soul (learnings).
+- Prefer a different strategy after a failure; never loop the same failing tool call without new evidence.
 
 Repository update protocol:
 - Call get_system_info before any repo edit for friday_package_dir, friday_repo_root, agent_workdir, and soul_path.
-- Read surrounding code first; match naming, imports, types, and patterns already in the file.
-- Prefer replace_in_file for surgical edits; write_file for new files or full rewrites.
+- Use search_code to locate symbols/strings, read_file for context, replace_in_file for surgical edits, write_file for new files.
+- After editing friday/*.py, run validate_python on changed files; fix errors before claiming success.
 - Avoid orphan scratch files in the workdir; integrate changes into the existing architecture.
-- After editing friday/*.py, validate with run_shell (import check, syntax check, lint, or targeted test).
 - Do not claim git cleanliness or success without tool-verified validation output.
-- Tell the user to restart python -m friday after Python source changes — modules are not hot-reloaded.
+- Tell the user to restart python -m friday after Python source changes, or use restart_friday when FRIDAY_SELF_RESTART_ENABLED=true.
 
 Self-modification (soul-driven, reactive):
 - soul.md holds durable intent (Preferences, Behaviors, Learnings, Environment, Self); friday/ source is the implementation.
+- Workflow: get_system_info → search_code → read_file → replace_in_file → validate_python → remember_soul (Self section).
 - Edit your own code when the user explicitly asks to change Friday/Iamnotjarvis, or when soul Behaviors/Preferences require
   new tools, config defaults, UI changes, or system-prompt behavior that memory alone cannot enforce.
+- Changes must land in friday_repo_root via file tools — never paste code-only answers without writing files.
 - Record applied source changes in soul Self section via remember_soul when appropriate.
 - Do not store secrets in soul; do not manually edit .friday/ registry.
+
+Token usage:
+- When the user asks about tokens, usage, or cost, call get_token_usage and report the numbers plainly — do not guess.
 
 Workspace file management (agent_workdir):
 - uploads/ — user uploads (attached in chat)
@@ -126,7 +144,15 @@ Text extraction and output-file rules:
 
 For coding tasks, prefer read_file/inspect_file/replace_in_file/write_file/write_output/run_shell/start_shell_job/deliver_output.
 When finished, respond with a short final summary and stop calling tools. Think Jarvis with a keyboard,
-not a committee meeting."""
+not a committee meeting.
+
+Autonomous operation (when enabled by the platform):
+- You may receive [Autonomous continuation] or [Autonomous job follow-up] messages without a live user prompt.
+- Treat these as real work: use tools, finish the task, or state clearly if no action is needed.
+- Job follow-ups: review shell output; fix failures, deliver outputs, or restart services as appropriate.
+- Continuations: pick up where the prior turn stopped; do not repeat completed steps.
+- A watchdog monitors all shell jobs: runaway processes, print loops, and hung jobs are stopped automatically.
+- If repeated tool calls stall (same call failing), stop retrying the same approach and try something different."""
 
 
 def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
@@ -224,12 +250,20 @@ def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
         "friday source",
         "system prompt",
     )
+    token_phrases = (
+        "token",
+        "tokens",
+        "token usage",
+        "how many tokens",
+        "usage stats",
+    )
 
     has_action = any(term in text for term in action_terms)
     has_host_target = any(term in text for term in host_terms)
     has_self_mod = any(phrase in text for phrase in self_mod_phrases)
+    has_token_query = any(phrase in text for phrase in token_phrases)
     refused = any(term in assistant_text.lower() for term in refusal_terms)
-    return refused or has_self_mod or (has_action and has_host_target)
+    return refused or has_self_mod or has_token_query or (has_action and has_host_target)
 
 
 def _tool_signature(name: str, args: Dict[str, Any]) -> str:
@@ -278,14 +312,7 @@ def _build_session_upload_context(uploads: List[Dict[str, Any]]) -> str:
 
 
 def _shell_run_failed(result: str) -> bool:
-    try:
-        payload = json.loads(result)
-    except json.JSONDecodeError:
-        return False
-    if payload.get("error"):
-        return False
-    outcome = payload.get("outcome") or {}
-    return bool(outcome.get("suspect_failure")) or outcome.get("exit_ok") is False
+    return shell_run_failed(result)
 
 
 async def _chat_with_retries(
@@ -293,6 +320,9 @@ async def _chat_with_retries(
     messages: List[Dict[str, Any]],
     bus: EventBus,
     settings: Settings,
+    tools: List[Dict[str, Any]],
+    *,
+    source: str = "agent_step",
 ) -> Dict[str, Any]:
     attempts = max(1, settings.llm_retries)
     timeout = max(5, settings.llm_timeout_seconds)
@@ -304,7 +334,12 @@ async def _chat_with_retries(
             return await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    partial(llm.chat_with_tools, messages=messages, tools=TOOL_DEFINITIONS),
+                    partial(
+                        llm.chat_with_tools,
+                        messages=messages,
+                        tools=tools,
+                        source=source,
+                    ),
                 ),
                 timeout=timeout,
             )
@@ -346,9 +381,20 @@ async def run_agent_turn(
     prior_agent_context: str = "",
     skip_expansion: bool = False,
     max_steps_override: Optional[int] = None,
-) -> Tuple[str, List[Dict[str, Any]]]:
+    role: Optional[str] = None,
+    extra_toolsets: Optional[List[str]] = None,
+    context_files_context: str = "",
+    skills_catalog: str = "",
+    checkpoint_manager: Optional[CheckpointManager] = None,
+    skills: Optional[Dict[str, SkillEntry]] = None,
+    persistent_memory: Optional[PersistentMemoryStore] = None,
+    hook_runner: Any = None,
+    delegate_runner: Any = None,
+    code_exec_runner: Any = None,
+) -> Tuple[str, List[Dict[str, Any]], TurnMistakeLog]:
     logger = logging.getLogger(__name__)
     step_limit = max_steps_override if max_steps_override is not None else max_steps
+    mistake_log = TurnMistakeLog()
 
     if skip_expansion:
         resolved_message = (effective_message or user_message).strip()
@@ -363,6 +409,7 @@ async def run_agent_turn(
             attachments=attachments,
             client_id=client_id,
         )
+    tools = resolve_tools(settings, role=role, extra_toolsets=extra_toolsets)
     ctx = ToolContext(
         bus=bus,
         sessions=sessions,
@@ -371,13 +418,24 @@ async def run_agent_turn(
         settings=settings,
         file_registry=file_registry,
         soul_store=soul_store,
+        usage_store=llm.usage_store,
         client_id=client_id,
+        checkpoint_manager=checkpoint_manager,
+        skills=skills,
+        persistent_memory=persistent_memory,
+        hook_runner=hook_runner,
+        delegate_runner=delegate_runner,
+        code_exec_runner=code_exec_runner,
     )
     composed_message = _build_user_message(resolved_message, attachments)
     upload_context = _build_session_upload_context(_merge_uploads(attachments, session_uploads))
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
+    if context_files_context:
+        messages.append({"role": "system", "content": context_files_context})
+    if skills_catalog:
+        messages.append({"role": "system", "content": skills_catalog})
     if role_prompt:
         messages.append({"role": "system", "content": role_prompt})
     if task_brief:
@@ -399,6 +457,7 @@ async def run_agent_turn(
                 "content": (
                     "Soul memory (persistent learnings from prior sessions). "
                     "Follow preferences and conventions here; do not recite unless relevant. "
+                    "Treat Learnings as mistakes to avoid — never repeat those failures. "
                     "As orchestrator, honor soul Behaviors that imply repo or platform changes: "
                     "call get_system_info, read affected files, apply minimal diffs under friday_package_dir, "
                     "validate, and record in soul Self when appropriate.\n\n"
@@ -411,8 +470,9 @@ async def run_agent_turn(
             {
                 "role": "system",
                 "content": (
-                    "Recent conversation memory, loaded from local storage. "
-                    "Use it for continuity when relevant, but do not repeat it unless asked.\n\n"
+                    "Recent conversation memory (loaded from disk when persistence is enabled). "
+                    "Distinct from soul.md — this is recent chat continuity, not curated long-term facts. "
+                    "Use for continuity when relevant, but do not repeat it unless asked.\n\n"
                     f"{memory_context}"
                 ),
             }
@@ -442,11 +502,15 @@ async def run_agent_turn(
             shell_failure_pending = False
 
         await bus.publish({"type": "agent_step", "step": step})
+        llm_source = "subagent" if role_prompt else "agent_step"
         try:
-            assistant = await _chat_with_retries(llm, messages, bus, settings)
+            assistant = await _chat_with_retries(
+                llm, messages, bus, settings, tools, source=llm_source
+            )
         except Exception as exc:
             await bus.publish({"type": "llm_error", "error": str(exc)})
-            return f"LLM error: {exc}", ctx.delivered_outputs
+            mistake_log.record(f"LLM error: {exc}")
+            return f"LLM error: {exc}", ctx.delivered_outputs, mistake_log
 
         content = assistant.get("content") or ""
         tool_calls = assistant.get("tool_calls")
@@ -488,7 +552,7 @@ async def run_agent_turn(
 
         if not tool_calls:
             await bus.publish({"type": "llm_turn_end"})
-            return final_text or "(no content)", ctx.delivered_outputs
+            return final_text or "(no content)", ctx.delivered_outputs, mistake_log
 
         for call in tool_calls:
             fn = call.get("function") or {}
@@ -512,9 +576,13 @@ async def run_agent_turn(
                         ),
                     }
                 )
+                mistake_log.record(
+                    f"Repeated failing tool call ({name}): {json.dumps(safe_args, ensure_ascii=False)[:240]}"
+                )
                 await bus.publish({"type": "agent_stall_detected", "tool": name})
             else:
                 result = await execute_tool(ctx, name, safe_args)
+                record_tool_outcome(mistake_log, name, safe_args, result)
                 if name == "run_shell" and _shell_run_failed(result):
                     shell_failure_pending = True
             await bus.publish({"type": "tool_result", "tool": name, "result_preview": result[:2000]})
@@ -527,5 +595,7 @@ async def run_agent_turn(
             )
 
     logger.warning("agent max steps exceeded")
+    mistake_log.step_budget_exhausted = True
+    mistake_log.record("Agent step budget exhausted before task completion")
     await bus.publish({"type": "agent_max_steps"})
-    return final_text or "Max agent steps reached.", ctx.delivered_outputs
+    return final_text or "Max agent steps reached.", ctx.delivered_outputs, mistake_log

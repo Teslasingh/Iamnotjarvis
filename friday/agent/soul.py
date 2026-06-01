@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+from friday.runtime.persist import atomic_write_text
+
 SOUL_TEMPLATE = """# Soul
 
 Persistent learnings Friday keeps across Iamnotjarvis sessions — orchestrator behaviors, repo conventions, and durable user preferences. Not every chat is saved.
@@ -51,10 +53,7 @@ class SoulStore:
         return self.path.read_text(encoding="utf-8")
 
     def save(self, content: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(content.rstrip() + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write_text(self.path, content.rstrip() + "\n")
 
     def reset(self) -> None:
         self.save(SOUL_TEMPLATE)
@@ -72,15 +71,40 @@ class SoulStore:
         stripped = _BULLET_RE.sub("", stripped)
         return not stripped.strip()
 
+    def extract_section_body(self, section: str) -> str:
+        section_name = SECTION_ALIASES.get(section.strip().lower(), section)
+        header = f"## {section_name}"
+        content = self.load()
+        if header not in content:
+            return ""
+        after = content.split(header, 1)[1]
+        next_header = re.search(r"\n##\s+\w+", after)
+        body = after[: next_header.start()] if next_header else after
+        body = body.strip()
+        if not body or not _BULLET_RE.search(body):
+            return ""
+        return body
+
     def build_context(self, max_chars: int) -> str:
         if max_chars <= 0:
             return ""
         content = self.load()
         if self.is_empty(content):
             return ""
-        if len(content) <= max_chars:
-            return content
-        return content[: max_chars - 20].rstrip() + "\n\n[... truncated ...]"
+        learnings = self.extract_section_body("learnings")
+        prefix = ""
+        if learnings:
+            prefix = (
+                "Past mistakes and lessons (avoid repeating these errors):\n"
+                f"{learnings}\n\n---\n\n"
+            )
+        budget = max_chars - len(prefix) if prefix else max_chars
+        if budget < 400 and prefix:
+            return prefix[:max_chars]
+        if len(content) <= budget:
+            return prefix + content
+        truncated = content[: budget - 20].rstrip() + "\n\n[... truncated ...]"
+        return prefix + truncated
 
     def append_bullet(self, section: str, text: str) -> bool:
         bullet_text = text.strip()

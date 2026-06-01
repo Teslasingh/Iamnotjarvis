@@ -17,15 +17,23 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
 
-from friday.agent.orchestrator import run_orchestrated_turn
+from friday.agent.autonomy import AutonomyEngine
+from friday.agent.checkpoints import CheckpointManager
+from friday.agent.code_exec import run_execute_code
 from friday.agent.memory import MemoryStore
+from friday.agent.persistent_memory import PersistentMemoryStore
 from friday.agent.soul import SoulStore
+from friday.batch.runner import BatchRunner
+from friday.hooks.registry import HookRegistry
+from friday.hooks.runner import HookRunner
+from friday.scheduler.store import CronJob, CronStore
+from friday.scheduler.worker import CronWorker
 from friday.config import Settings, get_settings
 from friday.events.bus import EventBus
-from friday.llm.client import LLMClient
-from friday.llm.soul_update import maybe_update_soul
+from friday.llm.usage import TokenUsageStore
 from friday.runtime.files import FileRegistry, guess_mime, is_path_under, is_preview_image, normalize_rel_path, sanitize_filename
 from friday.runtime.sessions import SessionManager
+from friday.runtime.watchdog import JobWatchdog
 
 logger = logging.getLogger(__name__)
 
@@ -107,33 +115,167 @@ class ChatBody(BaseModel):
     attachments: Optional[List[str]] = None
 
 
+class TaskBody(BaseModel):
+    message: str
+    client_id: Optional[str] = None
+
+
+class CronBody(BaseModel):
+    name: str = "job"
+    prompt: str
+    cron_expr: str = "0 9 * * *"
+    schedule_type: str = "cron"
+    skill_names: Optional[List[str]] = None
+
+
+class BatchBody(BaseModel):
+    prompts: List[str]
+
+
+class HookBody(BaseModel):
+    id: str
+    type: str = "gateway"
+    events: Optional[List[str]] = None
+    hook: Optional[str] = None
+    match: Optional[Dict[str, Any]] = None
+    action: Optional[Dict[str, Any]] = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    bus = EventBus(ring_max=settings.event_ring_max)
     workdir = settings.agent_workdir
     workdir_path = Path(workdir)
+    hook_registry = HookRegistry(workdir_path / ".friday" / "hooks.json")
+    hook_runner = HookRunner(
+        hook_registry, timeout_seconds=settings.hooks_webhook_timeout_seconds
+    )
+    bus = EventBus(
+        ring_max=settings.event_ring_max,
+        hook_runner=hook_runner,
+        hooks_enabled=settings.hooks_enabled,
+    )
     workdir_path.mkdir(parents=True, exist_ok=True)
     (_workdir_path(settings) / settings.upload_dir).mkdir(parents=True, exist_ok=True)
     (_workdir_path(settings) / settings.output_dir).mkdir(parents=True, exist_ok=True)
     sessions = SessionManager(bus=bus, default_cwd=workdir, settings=settings)
-    memory = MemoryStore(recent_turns=settings.memory_recent_turns)
-    memory.clear()
+    friday_dir = workdir_path / ".friday"
+    memory = MemoryStore(
+        recent_turns=settings.conversation_memory_max_turns,
+        persist_path=friday_dir / "conversation.json",
+        max_context_chars=settings.conversation_memory_max_context_chars,
+        persist_enabled=settings.conversation_memory_enabled,
+    )
+    if not settings.conversation_memory_enabled:
+        memory.clear()
     soul = SoulStore(workdir_path / "soul.md")
     soul.load()
+    persistent_memory = PersistentMemoryStore(workdir_path)
+    checkpoint_manager = CheckpointManager(
+        friday_dir / "checkpoints",
+        workdir_path,
+        settings.checkpoints_max_count,
+        settings.checkpoints_max_file_bytes,
+    )
+    usage = TokenUsageStore(
+        call_log_max=settings.token_usage_call_log_max,
+        persist_path=friday_dir / "token_usage.json",
+        persist_enabled=settings.token_usage_enabled and settings.token_usage_persist,
+    )
     app.state.settings = settings
     app.state.bus = bus
     app.state.sessions = sessions
     app.state.memory = memory
     app.state.soul = soul
+    app.state.persistent_memory = persistent_memory
+    app.state.checkpoint_manager = checkpoint_manager
+    app.state.hook_registry = hook_registry
+    app.state.usage = usage
     registry_path = workdir_path / ".friday" / "file_registry.json"
     registry = FileRegistry(registry_path, workdir_path)
     registry.register_existing_paths(workdir_path, [settings.upload_dir, settings.output_dir])
     app.state.file_registry = registry
+    watchdog = JobWatchdog(sessions=sessions, bus=bus, settings=settings)
+    app.state.watchdog = watchdog
+    async def _code_exec_runner(code: str) -> str:
+        return await run_execute_code(code, settings=settings, workdir=workdir_path)
+
+    autonomy = AutonomyEngine(
+        settings=settings,
+        bus=bus,
+        sessions=sessions,
+        memory=memory,
+        soul=soul,
+        usage=usage,
+        registry=registry,
+        queue_path=friday_dir / "task_queue.json",
+        watchdog=watchdog,
+        checkpoint_manager=checkpoint_manager,
+        persistent_memory=persistent_memory,
+        hook_runner=hook_runner,
+        code_exec_runner=_code_exec_runner,
+    )
+    app.state.autonomy = autonomy
+
+    cron_store = CronStore(friday_dir / "cron_jobs.json", settings.cron_max_jobs)
+    app.state.cron_store = cron_store
+
+    async def _cron_enqueue(prompt: str, meta: dict) -> None:
+        await autonomy.enqueue_cron(prompt, metadata=meta)
+
+    cron_worker = CronWorker(cron_store, _cron_enqueue, settings.cron_tick_seconds)
+    app.state.cron_worker = cron_worker
+
+    async def _batch_run_turn(prompt: str):
+        from friday.agent.orchestrator import run_orchestrated_turn
+        from friday.agent.turn_context import build_agent_extras
+        from friday.llm.client import LLMClient
+
+        llm = LLMClient(settings=settings, usage_store=usage)
+        extras = build_agent_extras(
+            settings,
+            workdir_path,
+            checkpoint_manager=checkpoint_manager,
+            persistent_memory=persistent_memory,
+            hook_runner=hook_runner,
+            delegate_runner=None,
+            code_exec_runner=_code_exec_runner,
+        )
+        reply, outputs, mistakes = await run_orchestrated_turn(
+            prompt,
+            llm=llm,
+            bus=bus,
+            sessions=sessions,
+            workdir=workdir,
+            allow_shell=settings.allow_shell,
+            max_steps=settings.max_agent_steps,
+            settings=settings,
+            soul_store=soul,
+            agent_extras=extras,
+        )
+        return reply, outputs, mistakes
+
+    batch_runner = BatchRunner(
+        friday_dir / "batches",
+        _batch_run_turn,
+        settings.batch_max_parallel,
+        settings.batch_max_items,
+    )
+    app.state.batch_runner = batch_runner
+
+    await watchdog.start()
+    await autonomy.start()
+    if settings.cron_enabled:
+        await cron_worker.start()
     try:
         yield
     finally:
-        memory.clear()
+        if settings.cron_enabled:
+            await cron_worker.stop()
+        await autonomy.stop()
+        await watchdog.stop()
+        if not settings.conversation_memory_enabled:
+            memory.clear()
 
 
 def create_app() -> FastAPI:
@@ -185,8 +327,10 @@ def create_app() -> FastAPI:
 
     @app.post("/logout")
     async def logout(request: Request) -> Response:
+        settings: Settings = request.app.state.settings
         memory: MemoryStore = request.app.state.memory
-        memory.clear()
+        if settings.conversation_memory_clear_on_logout:
+            memory.clear()
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie(AUTH_COOKIE)
         return resp
@@ -300,88 +444,89 @@ def create_app() -> FastAPI:
             raise HTTPException(400, "empty message")
         if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
             raise HTTPException(503, "Azure OpenAI is not configured.")
-        bus: EventBus = request.app.state.bus
-        sessions: SessionManager = request.app.state.sessions
-        memory: MemoryStore = request.app.state.memory
         registry: FileRegistry = request.app.state.file_registry
-        soul: SoulStore = request.app.state.soul
-        llm = LLMClient(settings=settings)
+        autonomy: AutonomyEngine = request.app.state.autonomy
         user_message = body.message.strip()
         client_id = body.client_id
 
         attachment_meta: List[Dict[str, Any]] = []
+        attachment_paths: List[str] = []
         for rel_path in body.attachments or []:
             path = _validate_attachment_path(settings, rel_path)
             meta = registry.register(path, _workdir_path(settings), name=path.name)
             meta["path"] = normalize_rel_path(meta.get("path") or rel_path)
             attachment_meta.append(meta)
+            attachment_paths.append(meta["path"])
+
+        if settings.autonomy_enabled and settings.autonomy_queue_user_tasks:
+            task = await autonomy.enqueue_user(
+                user_message,
+                client_id=client_id,
+                attachments=attachment_paths or None,
+            )
+            return {"accepted": True, "queued": True, "task_id": task.id}
 
         async def job() -> None:
-            try:
-                memory_context = memory.build_context()
-                session_uploads = memory.recent_attachments()
-                soul_context = ""
-                if settings.soul_enabled:
-                    soul_context = soul.build_context(settings.soul_max_context_chars)
-                    if soul_context:
-                        await bus.publish(
-                            {
-                                "type": "soul_loaded",
-                                "chars": len(soul_context),
-                            }
-                        )
-                if memory_context:
-                    await bus.publish(
-                        {
-                            "type": "memory_loaded",
-                            "turns": len(memory.recent_turns_list()),
-                        }
-                    )
-                reply, outputs = await run_orchestrated_turn(
-                    user_message,
-                    llm=llm,
-                    bus=bus,
-                    sessions=sessions,
-                    workdir=settings.agent_workdir,
-                    allow_shell=settings.allow_shell,
-                    max_steps=settings.max_agent_steps,
-                    settings=settings,
-                    memory_context=memory_context,
-                    soul_context=soul_context,
-                    attachments=attachment_meta,
-                    session_uploads=session_uploads,
-                    file_registry=registry,
-                    soul_store=soul,
-                    client_id=client_id,
-                )
-                memory.append_turn(user_message, reply, attachments=attachment_meta or None)
-                await bus.publish({"type": "memory_saved", "client_id": client_id})
-                if settings.soul_enabled and settings.soul_auto_update:
-                    asyncio.create_task(
-                        maybe_update_soul(
-                            soul,
-                            llm=llm,
-                            settings=settings,
-                            bus=bus,
-                            user_message=user_message,
-                            assistant_reply=reply,
-                            client_id=client_id,
-                        )
-                    )
-                await bus.publish(
-                    {
-                        "type": "chat_complete",
-                        "reply": reply,
-                        "client_id": client_id,
-                        "outputs": outputs,
-                    }
-                )
-            except Exception as exc:
-                logger.exception("chat job failed")
-                await bus.publish({"type": "chat_error", "error": str(exc), "client_id": client_id})
+            await autonomy.run_turn_immediate(
+                user_message,
+                client_id=client_id,
+                attachments=attachment_meta or None,
+            )
 
         asyncio.create_task(job())
-        return {"accepted": True}
+        return {"accepted": True, "queued": False}
+
+    @app.get("/api/autonomy")
+    async def api_autonomy_status(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        autonomy: AutonomyEngine = request.app.state.autonomy
+        return await autonomy.status()
+
+    @app.get("/api/tasks")
+    async def api_tasks_list(request: Request, limit: int = 50) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        autonomy: AutonomyEngine = request.app.state.autonomy
+        tasks = await autonomy.queue.list_tasks(limit=min(100, max(1, limit)))
+        return {"tasks": tasks, "enabled": settings.autonomy_enabled}
+
+    @app.post("/api/tasks")
+    async def api_tasks_enqueue(body: TaskBody, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        if not body.message.strip():
+            raise HTTPException(400, "empty message")
+        if not settings.autonomy_enabled:
+            raise HTTPException(400, "Autonomy is disabled")
+        autonomy: AutonomyEngine = request.app.state.autonomy
+        task = await autonomy.enqueue_manual(body.message.strip(), client_id=body.client_id)
+        return {"accepted": True, "task_id": task.id}
+
+    @app.post("/api/tasks/clear")
+    async def api_tasks_clear(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        autonomy: AutonomyEngine = request.app.state.autonomy
+        removed = await autonomy.queue.clear_completed()
+        return {"ok": True, "removed": removed}
+
+    @app.post("/api/watchdog/inspect")
+    async def api_watchdog_inspect(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        watchdog: JobWatchdog = request.app.state.watchdog
+        interventions = await watchdog.inspect_once()
+        return {
+            "ok": True,
+            "interventions": interventions,
+            "running_jobs": len(request.app.state.sessions.running_jobs()),
+        }
 
     @app.get("/api/soul")
     async def api_soul_get(request: Request) -> Dict[str, Any]:
@@ -407,6 +552,40 @@ def create_app() -> FastAPI:
         await bus.publish({"type": "soul_updated", "source": "reset"})
         return {"ok": True, "path": str(soul.path)}
 
+    @app.get("/api/conversation")
+    async def api_conversation_get(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        memory: MemoryStore = request.app.state.memory
+        return {
+            "turns": len(memory.recent_turns_list()),
+            "enabled": settings.conversation_memory_enabled,
+        }
+
+    @app.delete("/api/conversation")
+    async def api_conversation_delete(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        memory: MemoryStore = request.app.state.memory
+        memory.clear()
+        bus: EventBus = request.app.state.bus
+        await bus.publish({"type": "memory_cleared", "source": "reset"})
+        return {"ok": True}
+
+    @app.get("/api/usage")
+    async def api_usage_get(request: Request, scope: str = "session") -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        if not settings.token_usage_enabled:
+            return {"enabled": False}
+        usage: TokenUsageStore = request.app.state.usage
+        snapshot = usage.snapshot(scope)
+        snapshot["enabled"] = True
+        return snapshot
+
     @app.get("/api/jobs")
     async def api_jobs(request: Request) -> Dict[str, Any]:
         settings: Settings = request.app.state.settings
@@ -425,6 +604,155 @@ def create_app() -> FastAPI:
         if not detail:
             raise HTTPException(404, "job not found")
         return {"job": detail}
+
+    @app.post("/api/jobs/clear")
+    async def api_jobs_clear(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        sessions: SessionManager = request.app.state.sessions
+        removed = sessions.clear_jobs(include_running=False)
+        return {"ok": True, "removed": removed}
+
+    @app.get("/api/user-memory")
+    async def api_user_memory_get(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        pm: PersistentMemoryStore = request.app.state.persistent_memory
+        return {"content": pm.load_user(), "path": str(pm.user_path)}
+
+    @app.delete("/api/user-memory")
+    async def api_user_memory_delete(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        pm: PersistentMemoryStore = request.app.state.persistent_memory
+        pm.reset_user()
+        return {"ok": True}
+
+    @app.get("/api/agent-memory")
+    async def api_agent_memory_get(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        pm: PersistentMemoryStore = request.app.state.persistent_memory
+        return {"content": pm.load_memory(), "path": str(pm.memory_path)}
+
+    @app.delete("/api/agent-memory")
+    async def api_agent_memory_delete(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        pm: PersistentMemoryStore = request.app.state.persistent_memory
+        pm.reset_memory()
+        return {"ok": True}
+
+    @app.get("/api/checkpoints")
+    async def api_checkpoints_list(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        cp: CheckpointManager = request.app.state.checkpoint_manager
+        return {"checkpoints": cp.list_checkpoints(), "enabled": settings.checkpoints_enabled}
+
+    @app.post("/api/checkpoints/{checkpoint_id}/rollback")
+    async def api_checkpoint_rollback(checkpoint_id: str, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        cp: CheckpointManager = request.app.state.checkpoint_manager
+        result = cp.rollback(checkpoint_id)
+        await request.app.state.bus.publish({"type": "checkpoint_rollback", **result})
+        return result
+
+    @app.get("/api/cron")
+    async def api_cron_list(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        store: CronStore = request.app.state.cron_store
+        return {"jobs": [j.to_dict() for j in store.list_jobs()], "enabled": settings.cron_enabled}
+
+    @app.post("/api/cron")
+    async def api_cron_create(body: CronBody, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        store: CronStore = request.app.state.cron_store
+        job = CronJob(
+            id=uuid.uuid4().hex,
+            name=body.name,
+            prompt=body.prompt,
+            schedule_type=body.schedule_type,
+            cron_expr=body.cron_expr,
+            skill_names=body.skill_names or [],
+        )
+        store.upsert(job)
+        return {"job": job.to_dict()}
+
+    @app.delete("/api/cron/{job_id}")
+    async def api_cron_delete(job_id: str, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        store: CronStore = request.app.state.cron_store
+        return {"ok": store.delete(job_id)}
+
+    @app.post("/api/batch")
+    async def api_batch_start(body: BatchBody, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        if not settings.batch_enabled:
+            raise HTTPException(400, "Batch processing disabled")
+        runner: BatchRunner = request.app.state.batch_runner
+        batch_id = runner.start(body.prompts)
+        return {"batch_id": batch_id}
+
+    @app.get("/api/batch")
+    async def api_batch_list(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        runner: BatchRunner = request.app.state.batch_runner
+        return {"batches": runner.list_batches()}
+
+    @app.get("/api/batch/{batch_id}")
+    async def api_batch_status(batch_id: str, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        runner: BatchRunner = request.app.state.batch_runner
+        status = runner.status(batch_id)
+        if not status:
+            raise HTTPException(404, "batch not found")
+        return status
+
+    @app.get("/api/hooks")
+    async def api_hooks_list(request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        reg: HookRegistry = request.app.state.hook_registry
+        return {"hooks": reg.list_hooks(), "enabled": settings.hooks_enabled}
+
+    @app.post("/api/hooks")
+    async def api_hooks_create(body: HookBody, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        reg: HookRegistry = request.app.state.hook_registry
+        hook = body.model_dump()
+        return {"hook": reg.add(hook)}
+
+    @app.delete("/api/hooks/{hook_id}")
+    async def api_hooks_delete(hook_id: str, request: Request) -> Dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not _is_authenticated(request, settings):
+            raise HTTPException(401, "Unauthorized")
+        reg: HookRegistry = request.app.state.hook_registry
+        return {"ok": reg.delete(hook_id)}
 
     @app.post("/api/jobs/{job_id}/stop")
     async def api_job_stop(job_id: str, request: Request) -> Dict[str, Any]:

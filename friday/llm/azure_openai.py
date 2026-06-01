@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
@@ -55,17 +55,25 @@ class AzureOpenAILLM:
                 ) from exc
             return resp.json()
 
-    def chat_with_tools(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def chat_with_tools(
+        self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         payload: Dict[str, Any] = {"messages": messages}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        return self._post(payload)["choices"][0]["message"]
+        data = self._post(payload)
+        message = data["choices"][0]["message"]
+        usage = data.get("usage") or {}
+        return message, usage
 
-    def chat(self, messages: List[Dict[str, Any]], *, temperature: float = 0.2) -> str:
+    def chat(
+        self, messages: List[Dict[str, Any]], *, temperature: float = 0.2
+    ) -> Tuple[str, Dict[str, Any]]:
         payload: Dict[str, Any] = {"messages": messages}
         if self._supports_custom_temperature():
             payload["temperature"] = temperature
-        content = self._post(payload)["choices"][0]["message"].get("content") or ""
-        return str(content).strip()
-
+        data = self._post(payload)
+        content = data["choices"][0]["message"].get("content") or ""
+        usage = data.get("usage") or {}
+        return str(content).strip(), usage

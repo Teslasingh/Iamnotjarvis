@@ -123,15 +123,52 @@ body {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 4px;
+  flex-shrink: 0;
+}
+
+.rail-head-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.rail-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .rail-head .panel-title {
   margin-bottom: 0;
 }
 
-.jobs-hint {
-  margin: 0 0 8px;
-  line-height: 1.35;
+.job-count-badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: #041016;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.job-count-badge.hidden {
+  display: none;
+}
+
+.job-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  padding-right: 2px;
 }
 
 .job-list li.job-card {
@@ -385,6 +422,19 @@ body {
   color: #e2e8f0;
   border-left: 2px solid var(--accent);
   padding-left: 10px;
+}
+
+.msg-autonomous {
+  border-left-color: #7c3aed;
+}
+
+.msg-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a78bfa;
+  margin-bottom: 4px;
 }
 
 .msg-text {
@@ -718,12 +768,70 @@ input[type="password"]:focus {
     padding: 10px;
   }
 
-  .rail {
-    max-height: 22dvh;
+  .rail,
+  .chat {
+    min-height: 52dvh;
+    flex: 1 1 auto;
+    max-height: none;
   }
 
-  .chat {
-    min-height: 56dvh;
+  .job-list {
+    font-size: 13px;
+    min-height: 36dvh;
+  }
+
+  .job-list li.job-card {
+    padding: 12px;
+    gap: 8px;
+  }
+
+  .job-card-top {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "status cmd"
+      "actions actions";
+  }
+
+  .job-status {
+    grid-area: status;
+    font-size: 11px;
+    padding: 3px 9px;
+  }
+
+  .job-command {
+    grid-area: cmd;
+    font-size: 13px;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .job-actions {
+    grid-area: actions;
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .job-actions .btn.small-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+    min-height: 36px;
+  }
+
+  .job-meta {
+    font-size: 11px;
+  }
+
+  .job-peek {
+    font-size: 12px;
+    max-height: 6em;
+  }
+
+  .job-output {
+    max-height: min(32dvh, 320px);
+    font-size: 12px;
   }
 
   .messages {
@@ -732,8 +840,8 @@ input[type="password"]:focus {
   }
 
   .log {
-    min-height: 28dvh;
-    max-height: 38dvh;
+    min-height: 24dvh;
+    max-height: 32dvh;
   }
 
   .event-log {
@@ -774,15 +882,14 @@ input[type="password"]:focus {
     padding: 8px;
   }
 
-  .rail {
-    max-height: 18dvh;
-  }
-
+  .rail,
   .chat {
-    min-height: 60dvh;
+    min-height: 50dvh;
+    padding: 12px;
   }
 
+  .job-list,
   .messages {
-    min-height: 42dvh;
+    min-height: 34dvh;
   }
 }

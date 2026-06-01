@@ -13,7 +13,7 @@
         <div class="brand">
           <span class="dot"></span>
           <span>Friday</span>
-          <span class="sub">agent</span>
+          <span class="sub">agent · autonomous</span>
         </div>
         <div class="status" id="status">Idle</div>
         <div class="actions">
@@ -24,16 +24,18 @@
         </div>
       </header>
       <main class="grid">
-        <aside class="rail">
+        <aside class="rail" id="jobs-rail">
           <div class="rail-head">
-            <div class="panel-title">Shell jobs</div>
-            <button type="button" class="btn ghost small-btn" id="btn-clear-jobs" title="Clear list (does not stop processes)">
-              Clear
-            </button>
+            <div class="rail-head-title">
+              <div class="panel-title">Shell jobs</div>
+              <span id="job-count-badge" class="job-count-badge hidden" aria-live="polite"></span>
+            </div>
+            <div class="rail-head-actions">
+              <button type="button" class="btn ghost small-btn" id="btn-clear-jobs" title="Clear list (does not stop processes)">
+                Clear
+              </button>
+            </div>
           </div>
-          <p class="jobs-hint muted small">
-            Background jobs keep running across messages until they exit or you press Stop / ask Friday to stop. Clear only hides cards.
-          </p>
           <ul id="job-list" class="list job-list"></ul>
         </aside>
         <section class="chat">
@@ -48,7 +50,7 @@
               <div class="composer-input">
                 <input type="file" id="file-input" class="file-input-hidden" multiple />
                 <button type="button" class="btn ghost small-btn" id="btn-attach" title="Attach files">Attach</button>
-                <textarea id="chat-input" rows="3" placeholder="Ask Friday to inspect, change, test, search, query DBs, or fix code…"></textarea>
+                <textarea id="chat-input" rows="3" placeholder="Ask Friday… Use @path, @diff, or @https://… for context. /rollback to undo file edits."></textarea>
               </div>
               <button type="submit" class="btn primary" id="btn-send">Send</button>
             </form>

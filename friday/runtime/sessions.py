@@ -34,6 +34,7 @@ class JobSession:
     status: JobStatus = JobStatus.RUNNING
     return_code: Optional[int] = None
     created_at: float = field(default_factory=time.time)
+    last_output_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     stdout_buf: List[str] = field(default_factory=list)
     stderr_buf: List[str] = field(default_factory=list)
@@ -70,6 +71,12 @@ class SessionManager:
             "return_code": rc,
             "created_at": session.created_at,
             "finished_at": session.finished_at,
+            "runtime_seconds": (
+                int((session.finished_at or time.time()) - session.created_at)
+                if session.created_at
+                else None
+            ),
+            "seconds_since_output": int(time.time() - session.last_output_at),
             "last_output": preview,
             "stdout_preview": out[-preview_chars:] if out else "",
             "stderr_preview": err[-preview_chars:] if err else "",
@@ -132,10 +139,26 @@ class SessionManager:
             jid, _ = done.pop(0)
             self._jobs.pop(jid, None)
 
+    def clear_jobs(self, include_running: bool = False) -> int:
+        """Clear completed jobs from memory. Returns count removed."""
+        removed = 0
+        for jid, j in list(self._jobs.items()):
+            if include_running or j.status != JobStatus.RUNNING:
+                if j.status != JobStatus.RUNNING:
+                    self._jobs.pop(jid, None)
+                    removed += 1
+        return removed
+
     def list_jobs(self) -> List[Dict[str, Any]]:
         items = [self.job_dict(j) for j in self._jobs.values()]
         items.sort(key=lambda d: d.get("created_at") or 0.0, reverse=True)
         return items
+
+    def running_jobs(self) -> List[JobSession]:
+        return [j for j in self._jobs.values() if j.status == JobStatus.RUNNING]
+
+    def _touch_output(self, session: JobSession) -> None:
+        session.last_output_at = time.time()
 
     def get_job_dict(self, job_id: str) -> Optional[Dict[str, Any]]:
         session = self._jobs.get(job_id)
@@ -268,6 +291,7 @@ class SessionManager:
                     session.stdout_buf.append(text)
                 else:
                     session.stderr_buf.append(text)
+                self._touch_output(session)
                 await self._bus.publish(
                     {
                         "type": "job_output",
@@ -389,6 +413,7 @@ class SessionManager:
                     session.stdout_buf.append(text)
                 else:
                     session.stderr_buf.append(text)
+                self._touch_output(session)
                 await self._bus.publish(
                     {
                         "type": "job_output",
