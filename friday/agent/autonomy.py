@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 TASK_SOURCES = frozenset({"user", "continuation", "job_followup", "manual", "cron"})
 
+# Shell jobs started during these turns must not enqueue another job_followup.
+_JOB_FOLLOWUP_SKIP_TURN_SOURCES = frozenset({"job_followup", "delegate"})
+
 
 @dataclass
 class AutonomyTask:
@@ -167,6 +170,48 @@ class TaskQueue:
                 self._save()
             return cancelled
 
+    async def active_count_by_source(self, source: str) -> int:
+        async with self._lock:
+            return sum(
+                1
+                for task in self._tasks
+                if task.source == source and task.status in {"pending", "running"}
+            )
+
+    async def trim_source_backlog(
+        self,
+        source: str,
+        *,
+        keep_pending: int = 0,
+        reason: str,
+    ) -> int:
+        """Cancel excess pending/running tasks for a source, keeping newest pending up to keep_pending."""
+        async with self._lock:
+            active = [
+                task
+                for task in self._tasks
+                if task.source == source and task.status in {"pending", "running"}
+            ]
+            if not active:
+                return 0
+            pending = sorted(
+                [task for task in active if task.status == "pending"],
+                key=lambda task: task.created_at,
+                reverse=True,
+            )
+            keep_ids = {task.id for task in pending[: max(0, keep_pending)]}
+            cancelled = 0
+            for task in active:
+                if task.status == "pending" and task.id in keep_ids:
+                    continue
+                task.status = "cancelled"
+                task.finished_at = time.time()
+                task.error = reason[:500]
+                cancelled += 1
+            if cancelled:
+                self._save()
+            return cancelled
+
 
 def _continuation_message(index: int, max_cont: int, last_reply: str) -> str:
     preview = (last_reply or "").strip()[:2000]
@@ -239,6 +284,7 @@ class AutonomyEngine:
         self._listener_task: Optional[asyncio.Task] = None
         self._followed_jobs: set[str] = set()
         self._exhaustion_streak: Dict[str, int] = {}
+        self._job_followup_loop_warned = False
 
     @property
     def enabled(self) -> bool:
@@ -248,6 +294,20 @@ class AutonomyEngine:
         if not self.enabled:
             return
         self._active = True
+        trimmed = await self.queue.trim_source_backlog(
+            "job_followup",
+            keep_pending=0,
+            reason="job_followup backlog cleared on startup",
+        )
+        if trimmed:
+            logger.warning("trimmed %s stale job_followup task(s) on startup", trimmed)
+            await self.bus.publish(
+                {
+                    "type": "autonomy_loop_broken",
+                    "reason": "job_followup_backlog_trimmed",
+                    "cancelled": trimmed,
+                }
+            )
         self._worker_task = asyncio.create_task(self._worker_loop())
         if self.settings.autonomy_job_followup:
             self._listener_task = asyncio.create_task(self._event_listener())
@@ -386,9 +446,35 @@ class AutonomyEngine:
             }
         )
 
+    async def _active_job_followup_count(self) -> int:
+        return await self.queue.active_count_by_source("job_followup")
+
     async def _enqueue_job_followup(self, ev: Dict[str, Any]) -> None:
         job_id = str(ev.get("job_id") or "")
         if not job_id or job_id in self._followed_jobs:
+            return
+        # run_shell already returns output in the same agent turn; only background jobs need follow-up.
+        if not ev.get("background"):
+            self._followed_jobs.add(job_id)
+            return
+        turn_source = str(ev.get("autonomy_turn_source") or "").strip()
+        if turn_source in _JOB_FOLLOWUP_SKIP_TURN_SOURCES:
+            self._followed_jobs.add(job_id)
+            return
+        max_pending = max(1, self.settings.autonomy_job_followup_max_pending)
+        active = await self._active_job_followup_count()
+        if active >= max_pending:
+            self._followed_jobs.add(job_id)
+            if not self._job_followup_loop_warned:
+                self._job_followup_loop_warned = True
+                await self.bus.publish(
+                    {
+                        "type": "autonomy_loop_broken",
+                        "reason": "job_followup_max_pending",
+                        "active": active,
+                        "max_pending": max_pending,
+                    }
+                )
             return
         self._followed_jobs.add(job_id)
         if len(self._followed_jobs) > 500:
@@ -605,6 +691,7 @@ class AutonomyEngine:
                     soul_store=self.soul,
                     client_id=task.client_id,
                     agent_extras=extras,
+                    autonomy_turn_source=task.source,
                 )
 
                 stall_count = stall_counts["count"]
@@ -737,6 +824,7 @@ class AutonomyEngine:
             "poll_seconds": self.settings.autonomy_poll_seconds,
             "auto_continue": self.settings.autonomy_auto_continue,
             "job_followup": self.settings.autonomy_job_followup,
+            "job_followup_max_pending": self.settings.autonomy_job_followup_max_pending,
             "queue_user_tasks": self.settings.autonomy_queue_user_tasks,
             "max_continuations": self.settings.autonomy_max_continuations,
             "watchdog_enabled": self.settings.autonomy_watchdog_enabled,

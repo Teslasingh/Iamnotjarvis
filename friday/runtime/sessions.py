@@ -41,6 +41,8 @@ class JobSession:
     proc: Optional[asyncio.subprocess.Process] = None
     stop_requested: bool = False
     kill_process_group: bool = False
+    background: bool = False
+    autonomy_turn_source: Optional[str] = None
 
 
 class SessionManager:
@@ -123,6 +125,8 @@ class SessionManager:
                 "outcome": outcome,
                 "stdout_tail": out[-6000:],
                 "stderr_tail": err[-6000:],
+                "background": session.background,
+                "autonomy_turn_source": session.autonomy_turn_source,
             }
         )
 
@@ -249,12 +253,20 @@ class SessionManager:
         command: str,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        *,
+        autonomy_turn_source: Optional[str] = None,
     ) -> JobSession:
         if timeout is not None and timeout <= 0:
             timeout = None
         job_id = str(uuid.uuid4())
         cwd = cwd or self._default_cwd
-        session = JobSession(id=job_id, command=command, cwd=cwd)
+        session = JobSession(
+            id=job_id,
+            command=command,
+            cwd=cwd,
+            background=True,
+            autonomy_turn_source=autonomy_turn_source,
+        )
         self._jobs[job_id] = session
 
         await self._bus.publish(
@@ -364,11 +376,19 @@ class SessionManager:
         command: str,
         cwd: Optional[str] = None,
         timeout: float = 300.0,
+        *,
+        autonomy_turn_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a shell command to completion; publish job_* events."""
         job_id = str(uuid.uuid4())
         cwd = cwd or self._default_cwd
-        session = JobSession(id=job_id, command=command, cwd=cwd)
+        session = JobSession(
+            id=job_id,
+            command=command,
+            cwd=cwd,
+            background=False,
+            autonomy_turn_source=autonomy_turn_source,
+        )
         self._jobs[job_id] = session
         await self._bus.publish(
             {

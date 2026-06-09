@@ -144,6 +144,7 @@ async def _run_subagent(
         skip_expansion=True,
         max_steps_override=settings.multi_agent_subagent_max_steps,
         role=role if role in {"explore", "execute", "verify"} else "execute",
+        autonomy_turn_source="delegate",
         **kw,
     )
 
@@ -218,6 +219,7 @@ async def run_orchestrated_turn(
     soul_store: Optional[SoulStore] = None,
     client_id: Optional[str] = None,
     agent_extras: Optional[AgentExtras] = None,
+    autonomy_turn_source: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]], TurnMistakeLog]:
     extra_kw = agent_extras.as_kwargs() if agent_extras else {}
     analysis = await analyze_task(
@@ -256,6 +258,7 @@ async def run_orchestrated_turn(
             effective_message=expanded_query,
             task_brief=task_brief,
             skip_expansion=True,
+            autonomy_turn_source=autonomy_turn_source,
             **extra_kw,
         )
 

@@ -391,6 +391,7 @@ async def run_agent_turn(
     hook_runner: Any = None,
     delegate_runner: Any = None,
     code_exec_runner: Any = None,
+    autonomy_turn_source: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]], TurnMistakeLog]:
     logger = logging.getLogger(__name__)
     step_limit = max_steps_override if max_steps_override is not None else max_steps
@@ -426,6 +427,7 @@ async def run_agent_turn(
         hook_runner=hook_runner,
         delegate_runner=delegate_runner,
         code_exec_runner=code_exec_runner,
+        autonomy_turn_source=autonomy_turn_source,
     )
     composed_message = _build_user_message(resolved_message, attachments)
     upload_context = _build_session_upload_context(_merge_uploads(attachments, session_uploads))

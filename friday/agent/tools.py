@@ -60,6 +60,7 @@ class ToolContext:
     hook_runner: Any = None
     delegate_runner: Any = None
     code_exec_runner: Any = None
+    autonomy_turn_source: Optional[str] = None
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -825,7 +826,12 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
             return json.dumps({"error": "shell execution disabled by policy"})
         command = str(arguments.get("command", ""))
         cwd = arguments.get("cwd") or ctx.workdir
-        result = await ctx.sessions.run_command(command, cwd=cwd, timeout=600.0)
+        result = await ctx.sessions.run_command(
+            command,
+            cwd=cwd,
+            timeout=600.0,
+            autonomy_turn_source=ctx.autonomy_turn_source,
+        )
         return json.dumps(result, ensure_ascii=False)
 
     if name == "start_shell_job":
@@ -844,7 +850,12 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
                 t = -1.0
             if t > 0:
                 timeout = t
-        job = await ctx.sessions.spawn(command, cwd=cwd, timeout=timeout)
+        job = await ctx.sessions.spawn(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            autonomy_turn_source=ctx.autonomy_turn_source,
+        )
         return json.dumps(
             {
                 "job_id": job.id,

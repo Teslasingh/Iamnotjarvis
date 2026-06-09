@@ -1,0 +1,53 @@
+Naukri.com Login Credentials:
+Email: [anubhav7singh7@gmail.com]
+Password: Anubhav@458266
+
+APPLICATION STRATEGY:
+
+* Apply only to relevant jobs on Naukri
+* Prefer “Apply Now” / direct apply listings
+* Skip jobs already applied
+* Avoid external/long application flows
+
+PROFILE DETAILS (USE ONLY IF REQUIRED):
+Name: Anubhav Kumar Singh
+Experience: 5 Years
+Role: Senior Machine Learning Engineer (GenAI, CV, Robotics)
+Phone: 9717119296
+Address: Hyderbad
+
+Core Skills:
+Python, LLMs (RAG, Agents), YOLO, PyTorch, ROS, AWS, Docker
+
+FIXED RESPONSES (ONLY IF MANDATORY):
+Current CTC: 20 LPA (Fixed: 20)
+Expected CTC: 32–36 LPA
+Notice Period: 60 Days
+Work Preference: Remote (Worldwide)
+
+EXECUTION RULES:
+
+* Search and open relevant job listings
+* Click “Apply” only for direct/simple applications dont go on company website
+* Fill ONLY:
+  • Required fields (*)
+  • Mandatory dropdowns
+  • Resume upload (AnubhavKumarSingh_AI_MLE_Resume)
+
+SKIP CONDITIONS:
+
+* Long/multi-step applications
+* External redirections
+* Irrelevant roles
+
+DECISION LOGIC:
+Apply ONLY IF:
+
+* Role: AI / ML / GenAI / Computer Vision / Robotics
+* Experience Level: Mid–Senior (3+ years)
+* Job Type: Remote
+
+FORM HANDLING:
+
+* Auto-scroll if submit button is not visible
+* Ensure submission is completed before moving next

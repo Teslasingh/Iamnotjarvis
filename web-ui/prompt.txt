@@ -1,0 +1,52 @@
+LINKEDIN 
+Login Credentials:
+Email: [anubhav7singh7@gmail.com]
+Password: Anu@745632
+
+APPLICATION GUIDELINES:
+
+* Apply only via LinkedIn “Easy Apply” filter this out first
+* Fill only required fields
+* Skip already applied jobs
+
+BASIC PROFILE (USE ONLY WHEN REQUIRED):
+Name: Anubhav Kumar Singh
+Experience: 5 years
+Role: Senior Machine Learning Engineer (GenAI, CV, Robotics)
+Skills: Python, LLMs (RAG, Agents), YOLO, PyTorch, ROS, AWS, Docker
+Phone Number: 9717119296
+
+FIXED ANSWERS (ONLY IF REQUIRED):
+Current CTC: 20 / 20 LPA
+Expected CTC: 34 / 43 LPA
+Notice Period: 60 / 60 days
+Work Preference: Remote (Worldwide)
+
+EXECUTION RULES:
+
+* Search for relevant jobs
+* Open job listing
+* Click “Easy Apply” only
+
+Fill ONLY:
+• Required input fields (marked with *)
+• Mandatory dropdowns
+• Required uploads
+(Resume: AnubhavKumarSingh_AI_MLE_Resume — may already be selected)
+
+SKIP CONDITION:
+- If the application becomes long or complex → Skip and move to the next job
+- Never click the same job title/index twice in a row.
+
+DECISION LOGIC:
+Apply only if:
+
+* Role matches AI / ML / GenAI / CV / Robotics
+* Experience level is Mid–Senior (3+ years)
+* Job is Remote
+
+FORM HANDLING:
+
+* Scroll during review/application screens
+* If Submit/Application button is not visible → Scroll to locate it
+* Ensure submission is completed before moving to next job

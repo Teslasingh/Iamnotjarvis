@@ -69,6 +69,7 @@ async def run_delegate_tasks(
                     extra_toolsets=extra,
                     prior_agent_context=prior,
                     skip_expansion=True,
+                    autonomy_turn_source="delegate",
                 )
             except Exception as exc:
                 logger.exception("delegate child failed")

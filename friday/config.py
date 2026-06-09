@@ -91,6 +91,7 @@ class Settings:
     autonomy_max_continuations: int
     autonomy_auto_continue: bool
     autonomy_job_followup: bool
+    autonomy_job_followup_max_pending: int
     autonomy_queue_user_tasks: bool
     autonomy_watchdog_enabled: bool
     autonomy_watchdog_poll_seconds: int
@@ -204,6 +205,7 @@ def get_settings() -> Settings:
         in {"1", "true", "yes", "on", "y"},
         autonomy_job_followup=_env("AUTONOMY_JOB_FOLLOWUP", "true").lower()
         in {"1", "true", "yes", "on", "y"},
+        autonomy_job_followup_max_pending=max(1, _int_env("AUTONOMY_JOB_FOLLOWUP_MAX_PENDING", 1)),
         autonomy_queue_user_tasks=_env("AUTONOMY_QUEUE_USER_TASKS", "true").lower()
         in {"1", "true", "yes", "on", "y"},
         autonomy_watchdog_enabled=_env("AUTONOMY_WATCHDOG_ENABLED", "true").lower()
