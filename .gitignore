@@ -11,3 +11,6 @@ uploads/
 outputs/
 .friday/
 soul.md
+*.db
+*.db-shm
+*.db-wal

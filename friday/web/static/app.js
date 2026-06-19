@@ -10,16 +10,23 @@ const attachmentChips = $("#attachment-chips");
 const statusEl = $("#status");
 const clearLogBtn = $("#btn-clear-log");
 const clearJobsBtn = $("#btn-clear-jobs");
+const clearTasksBtn = $("#btn-clear-tasks");
 const jobCountBadge = $("#job-count-badge");
+const planCard = $("#plan-card");
+const taskList = $("#task-list");
+const autonomySummary = $("#autonomy-summary");
 
 const pageClientId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 const jobs = new Map();
+const tasks = new Map();
 const expandedJobIds = new Set();
 const pendingFiles = [];
 const LARGE_FILE_WARN_BYTES = 100 * 1024 * 1024;
 
 let jobsPollTimer = null;
+let tasksPollTimer = null;
 let liveOutputContainer = null;
+let currentPlan = null;
 
 chatStream.textContent = "";
 
@@ -202,9 +209,34 @@ async function hydrateJobsFromServer() {
   }
 }
 
+async function hydrateTasksFromServer() {
+  try {
+    const r = await fetch("/api/tasks", { credentials: "same-origin" });
+    if (!r.ok) return;
+    const j = await r.json();
+    tasks.clear();
+    for (const task of j.tasks || []) {
+      if (task && task.id) tasks.set(task.id, task);
+    }
+    const running = Array.from(tasks.values()).find((task) => task.status === "running" && task.metadata?.plan);
+    if (running?.metadata?.plan) {
+      currentPlan = running.metadata.plan;
+    }
+    renderTasks();
+    renderPlan();
+  } catch {
+    /* ignore */
+  }
+}
+
 function startJobsPolling() {
   if (jobsPollTimer) clearInterval(jobsPollTimer);
   jobsPollTimer = setInterval(hydrateJobsFromServer, 8000);
+}
+
+function startTasksPolling() {
+  if (tasksPollTimer) clearInterval(tasksPollTimer);
+  tasksPollTimer = setInterval(hydrateTasksFromServer, 8000);
 }
 
 function connectEvents() {
@@ -212,13 +244,17 @@ function connectEvents() {
   eventsWs.onopen = () => {
     setStatus("Connected");
     hydrateJobsFromServer();
+    hydrateTasksFromServer();
     startJobsPolling();
+    startTasksPolling();
   };
   eventsWs.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
       appendLog(data);
       updateJobFromEvent(data);
+      updateTaskFromEvent(data);
+      updatePlanFromEvent(data);
       if (data.type === "task_analyzed" && data.client_id === pageClientId) {
         setStatus("Analyzing task…");
       }
@@ -293,6 +329,10 @@ function connectEvents() {
       clearInterval(jobsPollTimer);
       jobsPollTimer = null;
     }
+    if (tasksPollTimer) {
+      clearInterval(tasksPollTimer);
+      tasksPollTimer = null;
+    }
     setStatus("Disconnected; reconnecting…");
     setTimeout(connectEvents, 1500);
   };
@@ -340,6 +380,180 @@ function appendUser(text, attachments) {
   div.appendChild(body);
   chatStream.appendChild(div);
   chatStream.scrollTop = chatStream.scrollHeight;
+}
+
+function normalizeStatus(status) {
+  return String(status || "pending").toLowerCase();
+}
+
+function updateTaskBadge() {
+  if (!autonomySummary) return;
+  const values = Array.from(tasks.values());
+  const active = values.filter((task) => ["pending", "running"].includes(normalizeStatus(task.status))).length;
+  if (!values.length) {
+    autonomySummary.classList.add("hidden");
+    autonomySummary.textContent = "";
+    return;
+  }
+  autonomySummary.classList.remove("hidden");
+  autonomySummary.textContent = active ? `${active} active` : `${values.length} task${values.length === 1 ? "" : "s"}`;
+}
+
+function renderPlan() {
+  if (!planCard) return;
+  const plan = currentPlan;
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+    planCard.className = "plan-card empty";
+    planCard.textContent = "No active plan";
+    return;
+  }
+  planCard.className = "plan-card";
+  planCard.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "plan-title";
+  title.textContent = plan.summary || "Mission plan";
+  planCard.appendChild(title);
+  const steps = document.createElement("div");
+  steps.className = "plan-steps";
+  for (const step of plan.steps) {
+    const row = document.createElement("div");
+    const status = normalizeStatus(step.status);
+    row.className = `plan-step plan-step--${status}`;
+    const badge = document.createElement("span");
+    badge.className = "plan-step-status";
+    badge.textContent = status;
+    const body = document.createElement("div");
+    body.className = "plan-step-body";
+    const head = document.createElement("div");
+    head.className = "plan-step-head";
+    head.textContent = `${step.id || "step"} · ${step.role || "execute"}`;
+    const goal = document.createElement("div");
+    goal.className = "plan-step-goal";
+    goal.textContent = step.goal || "";
+    body.append(head, goal);
+    if (Array.isArray(step.depends_on) && step.depends_on.length) {
+      const deps = document.createElement("div");
+      deps.className = "plan-step-deps";
+      deps.textContent = `after ${step.depends_on.join(", ")}`;
+      body.appendChild(deps);
+    }
+    row.append(badge, body);
+    steps.appendChild(row);
+  }
+  planCard.appendChild(steps);
+}
+
+function renderTasks() {
+  updateTaskBadge();
+  if (!taskList) return;
+  taskList.innerHTML = "";
+  const sorted = Array.from(tasks.values()).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  for (const task of sorted.slice(0, 8)) {
+    const li = document.createElement("li");
+    li.className = "task-card";
+    const status = normalizeStatus(task.status);
+    if (status === "running") li.classList.add("task-card--running");
+    const top = document.createElement("div");
+    top.className = "task-card-top";
+    const badge = document.createElement("span");
+    badge.className = `job-status ${status}`;
+    badge.textContent = status;
+    const label = document.createElement("span");
+    label.className = "task-label";
+    label.title = task.message || "";
+    label.textContent = task.message || task.id;
+    top.append(badge, label);
+    const meta = document.createElement("div");
+    meta.className = "job-meta";
+    const planStatus = task.metadata?.plan_status ? ` · plan: ${task.metadata.plan_status}` : "";
+    meta.textContent = `${task.source || "task"} · ${(task.id || "").slice(0, 8)}…${planStatus}`;
+    li.append(top, meta);
+    taskList.appendChild(li);
+  }
+}
+
+function setPlanStepStatus(stepId, status) {
+  if (!currentPlan || !Array.isArray(currentPlan.steps)) return;
+  for (const step of currentPlan.steps) {
+    if (step.id === stepId) {
+      step.status = status;
+      return;
+    }
+  }
+}
+
+function updatePlanFromEvent(data) {
+  if (data.client_id && data.client_id !== pageClientId && !data.autonomous) return;
+  if (data.type === "task_analyzed" && data.plan) {
+    currentPlan = data.plan;
+    renderPlan();
+    return;
+  }
+  if (data.type === "plan_created" && data.plan) {
+    currentPlan = data.plan;
+    renderPlan();
+    return;
+  }
+  if (data.type === "plan_step_started") {
+    setPlanStepStatus(data.step_id, "running");
+    renderPlan();
+  } else if (data.type === "plan_step_retry") {
+    setPlanStepStatus(data.step_id, "retrying");
+    renderPlan();
+  } else if (data.type === "plan_step_complete") {
+    setPlanStepStatus(data.step_id, "done");
+    renderPlan();
+  } else if (data.type === "plan_step_failed") {
+    setPlanStepStatus(data.step_id, "failed");
+    renderPlan();
+  }
+}
+
+function updateTaskFromEvent(data) {
+  if (data.type === "autonomy_task_enqueued" && data.task_id) {
+    const existing = tasks.get(data.task_id) || {};
+    tasks.set(data.task_id, {
+      ...existing,
+      id: data.task_id,
+      status: "pending",
+      source: data.source || existing.source || "user",
+      message: data.preview || existing.message || "",
+      client_id: data.client_id || existing.client_id,
+      created_at: existing.created_at || Date.now() / 1000,
+      metadata: existing.metadata || {},
+    });
+    renderTasks();
+  } else if (data.type === "autonomy_task_started" && data.task_id) {
+    const existing = tasks.get(data.task_id) || {};
+    tasks.set(data.task_id, {
+      ...existing,
+      id: data.task_id,
+      status: "running",
+      source: data.source || existing.source || "task",
+      client_id: data.client_id || existing.client_id,
+      created_at: existing.created_at || Date.now() / 1000,
+      metadata: existing.metadata || {},
+    });
+    renderTasks();
+  } else if (data.type === "autonomy_task_updated" && data.task_id) {
+    const existing = tasks.get(data.task_id) || {};
+    tasks.set(data.task_id, {
+      ...existing,
+      id: data.task_id,
+      metadata: data.metadata || existing.metadata || {},
+    });
+    if (data.metadata?.plan) currentPlan = data.metadata.plan;
+    renderTasks();
+    renderPlan();
+  } else if (data.type === "chat_complete" && data.task_id) {
+    const existing = tasks.get(data.task_id) || {};
+    tasks.set(data.task_id, { ...existing, id: data.task_id, status: "done" });
+    renderTasks();
+  } else if (data.type === "chat_error" && data.task_id) {
+    const existing = tasks.get(data.task_id) || {};
+    tasks.set(data.task_id, { ...existing, id: data.task_id, status: "failed" });
+    renderTasks();
+  }
 }
 
 function updateJobFromEvent(ev) {
@@ -657,5 +871,16 @@ if (clearJobsBtn) {
   });
 }
 
+if (clearTasksBtn) {
+  clearTasksBtn.addEventListener("click", async () => {
+    try {
+      await fetch("/api/tasks/clear", { method: "POST", credentials: "same-origin" });
+      await hydrateTasksFromServer();
+    } catch {}
+  });
+}
+
 connectEvents();
 renderJobs();
+renderTasks();
+renderPlan();

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple
 
+from friday.paths import SOUL_FILE
+
 CONTEXT_FILENAMES: Tuple[str, ...] = (
     ".hermes.md",
     "AGENTS.md",
@@ -15,7 +17,7 @@ CONTEXT_FILENAMES: Tuple[str, ...] = (
 def load_context_files(workdir: Path, max_chars: int, per_file_max: int = 8000) -> str:
     if max_chars <= 0:
         return ""
-    soul_lower = (workdir / "soul.md").resolve()
+    soul_lower = SOUL_FILE.resolve()
     soul_upper = (workdir / "SOUL.md").resolve()
     blocks: List[str] = []
     used = 0

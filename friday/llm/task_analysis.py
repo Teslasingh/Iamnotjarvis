@@ -7,6 +7,8 @@ import re
 from functools import partial
 from typing import Any, Dict, List, Optional
 
+from friday.agent.execution_intent import implies_host_execution
+from friday.agent.plan import normalize_plan
 from friday.config import Settings
 from friday.events.bus import EventBus
 from friday.llm.client import LLMClient
@@ -27,11 +29,27 @@ Required shape:
   "orchestrate": false,
   "complexity": "simple|moderate|complex",
   "rationale": "<why single or multi-agent>",
-  "subtasks": [{"role": "explore|execute|verify", "goal": "..."}]
+  "subtasks": [{"role": "explore|execute|verify", "goal": "..."}],
+  "plan": {
+    "summary": "<mission summary>",
+    "steps": [
+      {
+        "id": "stable_step_id",
+        "role": "explore|execute|verify",
+        "goal": "<specific step outcome>",
+        "depends_on": ["prior_step_id"],
+        "resources": ["path/module/service touched, if known"],
+        "parallel_safe": true,
+        "success_criteria": ["<step-specific check>", ...]
+      }
+    ]
+  }
 }
 
 Rules:
-- Never take the user prompt at face value. Expand it with engineering judgment.
+- When the user asks about live system state (processes, tmux, docker, services, "what's running"), expanded_query must instruct run_shell on THIS host and report stdout/stderr — never rewrite into a tutorial or cheat sheet.
+- When the user says "run X", "on my system", or names a shell command, preserve execution intent; do not rewrite into "explain how to".
+- Never take the user prompt at face value for engineering tasks — but do NOT convert execution/status checks into documentation requests.
 - Preserve user intent; do not answer the question or refuse the task.
 - expanded_query: add missing specifics (files, formats, commands, validation steps, success criteria). Keep under 180 words.
   If already clear and specific, return the original query unchanged.
@@ -44,11 +62,14 @@ Rules:
   research + implement + validate, multi-module or multi-file code changes, cross-domain steps
   (web + filesystem + shell), or high ambiguity requiring separate investigation paths.
 - orchestrate: false for greetings, pure Q&A, single commands, single-file edits, already-specific one-step requests.
-- subtasks: max 3 entries when orchestrate is true. Roles:
+- subtasks: compatibility summary of the plan; max configured entries when orchestrate is true. Roles:
   explore = Code Analyzer (read/search/map, no mutations);
   execute = Implementation Agent (edit/run/mutate);
   verify = QA Tester (validate, self-heal, confirm success_criteria).
   Omit subtasks or use [] when orchestrate is false.
+- plan: provide a dependency graph for orchestrated work. Use stable snake_case IDs. Steps with no dependency may run in parallel.
+  Mark execute/write-heavy steps as parallel_safe=false unless resources are explicit and non-overlapping.
+  Include resources for files/modules/services each step expects to touch. Verify steps should depend on relevant execute steps.
 - complexity: simple = one step; moderate = few related steps; complex = multi-phase or multi-domain."""
 
 _SKIP_PATTERNS = (
@@ -72,6 +93,10 @@ def _should_skip_analysis(message: str, settings: Settings) -> bool:
         return True
     lowered = text.lower()
     if len(text) < settings.query_expansion_min_chars:
+        return True
+    if lowered.startswith("[autonomous"):
+        return True
+    if implies_host_execution(text):
         return True
     for pattern in _SKIP_PATTERNS:
         if re.match(pattern, lowered, re.IGNORECASE):
@@ -108,6 +133,7 @@ def _default_analysis(original: str) -> Dict[str, Any]:
         "complexity": "simple",
         "rationale": "analysis skipped or unavailable",
         "subtasks": [],
+        "plan": {"summary": original, "steps": []},
     }
 
 
@@ -147,13 +173,50 @@ def _normalize_analysis(payload: Dict[str, Any], original: str, settings: Settin
             if role in _VALID_ROLES and goal:
                 subtasks.append({"role": role, "goal": goal})
 
-    if orchestrate and not subtasks:
+    plan_raw = payload.get("plan")
+    plan_has_steps = (
+        isinstance(plan_raw, dict)
+        and isinstance(plan_raw.get("steps"), list)
+        and bool(plan_raw.get("steps"))
+    ) or (isinstance(payload.get("steps"), list) and bool(payload.get("steps")))
+
+    if orchestrate and not subtasks and not plan_has_steps and complexity == "complex":
         subtasks = [
             {"role": "explore", "goal": f"Investigate context and constraints for: {intent}"},
             {"role": "execute", "goal": f"Implement the user request: {expanded}"},
             {"role": "verify", "goal": "Validate results, fix failures, confirm success criteria"},
         ]
         subtasks = subtasks[: settings.multi_agent_max_subagents]
+    elif orchestrate and not subtasks and not plan_has_steps:
+        orchestrate = False
+
+    if implies_host_execution(original):
+        expanded = original
+        orchestrate = False
+        complexity = "simple"
+        subtasks = []
+
+    plan = normalize_plan(
+        payload,
+        intent=intent,
+        expanded_query=expanded,
+        subtasks=subtasks,
+        success_criteria=success_criteria,
+        max_steps=settings.multi_agent_max_plan_steps,
+    )
+    if not orchestrate:
+        plan = normalize_plan(
+            {"plan": {"summary": intent, "steps": []}},
+            intent=intent,
+            expanded_query="",
+            subtasks=[],
+            success_criteria=[],
+            max_steps=1,
+        )
+    elif not plan.steps:
+        orchestrate = False
+    else:
+        subtasks = plan.subtasks()
 
     return {
         "original": original,
@@ -166,6 +229,7 @@ def _normalize_analysis(payload: Dict[str, Any], original: str, settings: Settin
         "complexity": complexity,
         "rationale": rationale,
         "subtasks": subtasks,
+        "plan": plan.to_dict(),
         "applied": expanded.lower() != original.lower(),
     }
 
@@ -189,6 +253,13 @@ def _build_analysis_user_prompt(
 
 
 def build_task_brief(analysis: Dict[str, Any]) -> str:
+    complexity = str(analysis.get("complexity") or "simple").lower()
+    if complexity == "simple":
+        return (
+            "Task analysis (internal; do not recite):\n"
+            f"Intent: {analysis.get('intent', '')}\n"
+            f"Request: {analysis.get('expanded_query', '')}"
+        )
     lines = [
         "Task analysis (use for planning; do not recite to the user):",
         f"Intent: {analysis.get('intent', '')}",
@@ -210,6 +281,19 @@ def build_task_brief(analysis: Dict[str, Any]) -> str:
         lines.append("Success criteria:")
         for item in success:
             lines.append(f"- {item}")
+    plan = analysis.get("plan") or {}
+    steps = plan.get("steps") if isinstance(plan, dict) else []
+    if isinstance(steps, list) and steps:
+        lines.append("Execution plan:")
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            deps = step.get("depends_on") or []
+            dep_text = f" after {', '.join(deps)}" if deps else ""
+            lines.append(
+                f"- {step.get('id', 'step')} ({step.get('role', 'execute')}{dep_text}): "
+                f"{step.get('goal', '')}"
+            )
     rationale = analysis.get("rationale")
     if rationale:
         lines.append(f"Routing rationale: {rationale}")
@@ -285,6 +369,8 @@ async def analyze_task(
             "complexity": result["complexity"],
             "orchestrate": result["orchestrate"],
             "intent": result["intent"][:500],
+            "success_criteria": result["success_criteria"][:8],
+            "plan": result.get("plan") or {"summary": result["intent"], "steps": []},
             "client_id": client_id,
         }
     )

@@ -38,6 +38,28 @@ SECTION_ALIASES: Dict[str, str] = {
 
 _SECTION_HEADER_RE = re.compile(r"^##\s+(\w+)\s*$", re.MULTILINE)
 _BULLET_RE = re.compile(r"^\s*-\s+", re.MULTILINE)
+_ENVIRONMENT_MAX_BULLETS = 5
+
+
+def normalize_bullet_text(text: str) -> str:
+    cleaned = re.sub(r"\(\d{4}-\d{2}-\d{2}\)", "", text.lower())
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def bullet_already_exists(section_body: str, text: str) -> bool:
+    target = normalize_bullet_text(text)
+    if not target:
+        return True
+    for line in section_body.splitlines():
+        if not line.strip().startswith("-"):
+            continue
+        existing = normalize_bullet_text(line.lstrip("- ").strip())
+        if not existing:
+            continue
+        if target == existing or target in existing or existing in target:
+            return True
+    return False
 
 
 class SoulStore:
@@ -112,6 +134,9 @@ class SoulStore:
             return False
         section_name = SECTION_ALIASES.get(section.strip().lower(), "Learnings")
         content = self.load()
+        existing_body = self.extract_section_body(section_name.lower())
+        if existing_body and bullet_already_exists(existing_body, bullet_text):
+            return False
         ts = time.strftime("%Y-%m-%d", time.gmtime())
         bullet = f"- ({ts}) {bullet_text}"
         header = f"## {section_name}"
@@ -133,5 +158,10 @@ class SoulStore:
             rest = ""
 
         section_body = section_body.rstrip() + f"\n{bullet}\n"
+        if section_name == "Environment":
+            bullets = [line for line in section_body.splitlines() if line.strip().startswith("-")]
+            if len(bullets) > _ENVIRONMENT_MAX_BULLETS:
+                keep = bullets[-_ENVIRONMENT_MAX_BULLETS:]
+                section_body = "\n" + "\n".join(keep) + "\n"
         self.save(before + header + section_body + rest)
         return True

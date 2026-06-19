@@ -6,6 +6,7 @@ import logging
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401 — Any used by agent extras
 
+from friday.agent.execution_intent import implies_host_execution
 from friday.agent.checkpoints import CheckpointManager
 from friday.agent.mistakes import TurnMistakeLog, record_tool_outcome, shell_run_failed
 from friday.agent.persistent_memory import PersistentMemoryStore
@@ -54,6 +55,7 @@ Shell behavior (approximates your normal CLI; not a full interactive TTY):
 
 Tool policy:
 - For actionable host requests, use tools first. Do not give manual instructions as the first response.
+- When the user asks what is running (tmux, processes, docker, services) or says "on my system", run diagnostic shell commands immediately and report live output — not a tutorial.
 - DEFAULT start_shell_job for anything the user runs as an application — dev servers, watchers, GUIs, games,
   notebooks, bots — and OMIT the timeout field entirely so jobs run indefinitely until exit or explicit stop_shell_job.
   Never pass tiny timeouts like 5–120 seconds unless the task is deliberately bounded (e.g. benchmark with hard cap).
@@ -136,20 +138,22 @@ Upload-driven task protocol:
 
 Text extraction and output-file rules:
 - NEVER claim text was extracted, converted, OCR'd, or saved unless you used tools and verified stdout or file contents.
-- For images, scans, or PDFs: inspect_file first, then run_shell with Python (pytesseract, pdfplumber, pymupdf, etc.) or native OCR tools.
+- For images, scans, or PDFs: inspect_file first, then run_shell with Python (pdfplumber, pymupdf, easyocr, etc.) or native OCR tools.
+- Tesseract is optional and already configured on this host when needed (web-ui/.env TESSERACT_CMD). Do NOT install, PATH-check, or re-verify Tesseract unless the user explicitly asks about OCR.
 - When the user asks for a .txt or any downloadable output: prefer write_output(filename, content) which saves UTF-8 under output_dir and registers the download automatically. Alternatively write_file under output_dir then deliver_output in the same turn.
 - Save text outputs as UTF-8 with normalized line endings. On Windows, write_output includes a UTF-8 BOM so Notepad opens files correctly.
 - On follow-up messages ("give me the txt file"), use session upload paths from context — do NOT ask to re-upload unless list_dir shows the file is gone.
 - If you extracted text in a prior turn but did not save it, re-read the source upload from disk and write the output file now.
 
 For coding tasks, prefer read_file/inspect_file/replace_in_file/write_file/write_output/run_shell/start_shell_job/deliver_output.
-When finished, respond with a short final summary and stop calling tools. Think Jarvis with a keyboard,
-not a committee meeting.
+For actionable requests, use tools before explaining; do not end a turn with only a plan or manual instructions.
+Think Jarvis with a keyboard, not a committee meeting.
 
 Autonomous operation (when enabled by the platform):
 - You may receive [Autonomous continuation] or [Autonomous job follow-up] messages without a live user prompt.
 - Treat these as real work: use tools, finish the task, or state clearly if no action is needed.
 - Job follow-ups: review shell output; fix failures, deliver outputs, or restart services as appropriate.
+- If a job follow-up is for a diagnostic/probe command (Test-Path, where, version checks) that already succeeded, reply in one sentence and stop — do not spawn more verification commands.
 - Continuations: pick up where the prior turn stopped; do not repeat completed steps.
 - A watchdog monitors all shell jobs: runaway processes, print loops, and hung jobs are stopped automatically.
 - If repeated tool calls stall (same call failing), stop retrying the same approach and try something different."""
@@ -157,15 +161,19 @@ Autonomous operation (when enabled by the platform):
 
 def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
     text = user_message.lower()
+    if implies_host_execution(user_message):
+        return True
     informational_prefixes = (
         "what is ",
-        "what are ",
         "why ",
         "explain ",
         "how does ",
+        "how do i ",
         "tell me ",
     )
     if text.strip().startswith(informational_prefixes):
+        return False
+    if text.strip().startswith("what are ") and not implies_host_execution(user_message):
         return False
 
     action_terms = (
@@ -187,6 +195,18 @@ def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
         "run",
         "execute",
         "launch",
+        "start",
+        "build",
+        "edit",
+        "change",
+        "make",
+        "test",
+        "debug",
+        "deploy",
+        "compile",
+        "configure",
+        "implement",
+        "refactor",
         "server",
         "kill",
         "stop",
@@ -208,7 +228,6 @@ def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
         "download",
         "extract",
         "convert",
-        "ocr",
         "export",
         "save",
         "give",
@@ -263,11 +282,40 @@ def _requires_tool_use(user_message: str, assistant_text: str) -> bool:
     has_self_mod = any(phrase in text for phrase in self_mod_phrases)
     has_token_query = any(phrase in text for phrase in token_phrases)
     refused = any(term in assistant_text.lower() for term in refusal_terms)
-    return refused or has_self_mod or has_token_query or (has_action and has_host_target)
+    return (
+        refused
+        or has_self_mod
+        or has_token_query
+        or has_action
+        or has_host_target
+    )
 
 
 def _tool_signature(name: str, args: Dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+
+
+def _shell_command_fingerprint(name: str, args: Dict[str, Any]) -> str:
+    if name not in {"run_shell", "start_shell_job"}:
+        return ""
+    command = str(args.get("command") or "").strip().lower()
+    if not command:
+        return ""
+    return " ".join(command.split())
+
+
+def _planning_language(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "i will ",
+        "i'll ",
+        "you should ",
+        "next i would ",
+        "steps:",
+        "step 1",
+        "here's what i would do",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _build_user_message(user_message: str, attachments: Optional[List[Dict[str, Any]]]) -> str:
@@ -486,10 +534,24 @@ async def run_agent_turn(
     await bus.publish({"type": "llm_turn_start", "user": composed_message[:2000]})
 
     final_text = ""
-    tool_use_nudged = False
+    tool_use_nudges = 0
+    max_tool_nudges = 3
     tool_counts: Dict[str, int] = {}
+    shell_fingerprints: Dict[str, int] = {}
+    strategy_pivot_pending = False
     shell_failure_pending = False
     for step in range(step_limit):
+        if strategy_pivot_pending:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Repeated tool calls detected. Stop retrying the same command or path. "
+                        "Use a materially different strategy, tool, or approach now."
+                    ),
+                }
+            )
+            strategy_pivot_pending = False
         if shell_failure_pending:
             messages.append(
                 {
@@ -518,10 +580,11 @@ async def run_agent_turn(
         tool_calls = assistant.get("tool_calls")
         should_retry_with_tools = (
             not tool_calls
-            and not tool_use_nudged
+            and tool_use_nudges < max_tool_nudges
             and (
                 _requires_tool_use(resolved_message, content)
-                or bool(_merge_uploads(attachments, session_uploads))
+                or _planning_language(content)
+                or bool(attachments)
             )
         )
         messages.append(
@@ -533,7 +596,7 @@ async def run_agent_turn(
         )
 
         if should_retry_with_tools:
-            tool_use_nudged = True
+            tool_use_nudges += 1
             messages.append(
                 {
                     "role": "system",
@@ -568,6 +631,11 @@ async def run_agent_turn(
             safe_args = args if isinstance(args, dict) else {}
             signature = _tool_signature(name, safe_args)
             tool_counts[signature] = tool_counts.get(signature, 0) + 1
+            shell_fp = _shell_command_fingerprint(name, safe_args)
+            if shell_fp:
+                shell_fingerprints[shell_fp] = shell_fingerprints.get(shell_fp, 0) + 1
+                if shell_fingerprints[shell_fp] > 2:
+                    strategy_pivot_pending = True
             if tool_counts[signature] > 2:
                 result = json.dumps(
                     {
@@ -581,11 +649,13 @@ async def run_agent_turn(
                 mistake_log.record(
                     f"Repeated failing tool call ({name}): {json.dumps(safe_args, ensure_ascii=False)[:240]}"
                 )
+                record_tool_outcome(mistake_log, name, safe_args, result)
+                strategy_pivot_pending = True
                 await bus.publish({"type": "agent_stall_detected", "tool": name})
             else:
                 result = await execute_tool(ctx, name, safe_args)
                 record_tool_outcome(mistake_log, name, safe_args, result)
-                if name == "run_shell" and _shell_run_failed(result):
+                if name in {"run_shell", "start_shell_job", "get_shell_job"} and _shell_run_failed(result):
                     shell_failure_pending = True
             await bus.publish({"type": "tool_result", "tool": name, "result_preview": result[:2000]})
             messages.append(

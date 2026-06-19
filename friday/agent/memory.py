@@ -10,6 +10,12 @@ from friday.runtime.persist import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
+_AUTONOMOUS_USER_PREFIXES = (
+    "[autonomous",
+    "[job follow-up]",
+    "[continuation ",
+)
+
 
 class MemoryStore:
     """Conversation memory with optional disk persistence."""
@@ -21,11 +27,13 @@ class MemoryStore:
         persist_path: Optional[Path] = None,
         max_context_chars: int = 12000,
         persist_enabled: bool = True,
+        skip_autonomous_in_context: bool = True,
     ) -> None:
         self.recent_turns = max(1, recent_turns)
         self.max_context_chars = max(500, max_context_chars)
         self.persist_path = persist_path.resolve() if persist_path else None
         self.persist_enabled = persist_enabled and self.persist_path is not None
+        self.skip_autonomous_in_context = skip_autonomous_in_context
         self._records: List[Dict[str, Any]] = []
         if self.persist_enabled:
             self.load()
@@ -49,17 +57,27 @@ class MemoryStore:
         except OSError as exc:
             logger.warning("conversation memory persist failed: %s", exc)
 
+    @staticmethod
+    def _is_autonomous_user_text(user_message: str) -> bool:
+        text = str(user_message or "").strip().lower()
+        return any(text.startswith(prefix) for prefix in _AUTONOMOUS_USER_PREFIXES)
+
     def append_turn(
         self,
         user_message: str,
         assistant_reply: str,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        *,
+        source: str = "user",
+        autonomous: bool = False,
     ) -> None:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "user": user_message,
             "assistant": assistant_reply,
             "attachments": attachments or [],
+            "source": source,
+            "autonomous": autonomous or source in {"job_followup", "continuation", "cron"},
         }
         self._records.append(record)
         self.compact()
@@ -78,6 +96,8 @@ class MemoryStore:
     def recent_attachments(self) -> List[Dict[str, Any]]:
         seen: Dict[str, Dict[str, Any]] = {}
         for turn in self._records:
+            if turn.get("autonomous"):
+                continue
             for item in turn.get("attachments") or []:
                 path = str(item.get("path") or "")
                 if path:
@@ -91,6 +111,10 @@ class MemoryStore:
         parts: List[str] = []
         total = 0
         for idx, turn in enumerate(turns, 1):
+            if self.skip_autonomous_in_context and (
+                turn.get("autonomous") or self._is_autonomous_user_text(str(turn.get("user", "")))
+            ):
+                continue
             user = str(turn.get("user", ""))[:1200]
             assistant = str(turn.get("assistant", ""))[:1600]
             att_lines = []

@@ -55,7 +55,15 @@ def analyze_shell_streams(
 
     suspect = False
     if not exit_ok:
-        suspect = True
+        benign = (
+            re.search(r"error connecting to /tmp/tmux-\d+/default \(No such file or directory\)", err, re.I)
+            or re.search(r"no server running on", combined, re.I)
+            or re.search(r"no such file or directory", err, re.I) and "tmux" in combined.lower()
+        )
+        if benign:
+            suspect = False
+        else:
+            suspect = True
     elif stderr_nonempty and re.search(r"error|exception|traceback", err, re.IGNORECASE):
         suspect = True
     elif any(s in ordered for s in ("traceback", "syntax_error", "fatal_error")):

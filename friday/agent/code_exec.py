@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from friday.config import Settings
+from friday.paths import SANDBOX_DIR
 
 _RPC_BOOTSTRAP = textwrap.dedent(
     '''
@@ -64,7 +65,7 @@ async def run_execute_code(
     if not settings.code_exec_enabled:
         return json.dumps({"error": "execute_code disabled; set CODE_EXEC_ENABLED=true"})
     run_id = secrets.token_hex(8)
-    sandbox = workdir / ".friday" / "sandbox" / run_id
+    sandbox = SANDBOX_DIR / run_id
     sandbox.mkdir(parents=True, exist_ok=True)
     script_path = sandbox / "script.py"
     script_path.write_text(code, encoding="utf-8")

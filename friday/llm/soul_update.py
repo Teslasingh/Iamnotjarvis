@@ -36,6 +36,7 @@ Save ONLY durable facts worth remembering next month:
 
 Do NOT save:
 - one-off task details or transient command output
+- repeated OCR/Tesseract install/PATH diagnostics (one consolidated Environment note is enough)
 - full conversation transcripts
 - secrets, passwords, API keys, tokens, or credentials
 - greetings, acknowledgments, or trivial exchanges
@@ -55,26 +56,32 @@ _SKIP_PATTERNS = (
 )
 
 
+_SKIP_AUTONOMOUS_SOURCES = frozenset({"job_followup", "continuation", "cron"})
+
+
 def _should_skip_update(
     user_message: str,
     assistant_reply: str,
     settings: Settings,
     mistake_log: Optional[TurnMistakeLog] = None,
+    task_source: Optional[str] = None,
 ) -> Optional[str]:
     if not settings.soul_enabled or not settings.soul_auto_update:
         return "disabled"
+    if settings.soul_auto_update_skip_autonomous and task_source in _SKIP_AUTONOMOUS_SOURCES:
+        return "autonomous_source"
     user = user_message.strip()
     assistant = assistant_reply.strip()
     if not user or not assistant:
         return "empty_turn"
-    if mistake_log and mistake_log.has_entries():
-        return None
     if len(user) + len(assistant) < 40:
         return "too_short"
     lowered = user.lower()
     for pattern in _SKIP_PATTERNS:
         if re.match(pattern, lowered, re.IGNORECASE):
             return "trivial_message"
+    if user.lower().startswith("[autonomous"):
+        return "autonomous_message"
     return None
 
 
@@ -130,8 +137,15 @@ async def maybe_update_soul(
     assistant_reply: str,
     client_id: Optional[str] = None,
     mistake_log: Optional[TurnMistakeLog] = None,
+    task_source: Optional[str] = None,
 ) -> None:
-    skip_reason = _should_skip_update(user_message, assistant_reply, settings, mistake_log)
+    skip_reason = _should_skip_update(
+        user_message,
+        assistant_reply,
+        settings,
+        mistake_log,
+        task_source=task_source,
+    )
     if skip_reason:
         await bus.publish(
             {

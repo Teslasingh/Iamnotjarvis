@@ -4,7 +4,7 @@ import re
 import time
 from pathlib import Path
 
-from friday.agent.soul import SoulStore
+from friday.agent.soul import SoulStore, bullet_already_exists, normalize_bullet_text
 from friday.config import Settings
 from friday.runtime.persist import atomic_write_text
 
@@ -58,6 +58,9 @@ class PersistentMemoryStore:
         if section_name not in {"Preferences", "Learnings", "Environment"}:
             section_name = "Learnings"
         content = self._ensure(path, template)
+        existing = self._extract_section(content, section_name)
+        if existing and bullet_already_exists(existing, bullet_text):
+            return False
         ts = time.strftime("%Y-%m-%d", time.gmtime())
         bullet = f"- ({ts}) {bullet_text}"
         header = f"## {section_name}"
@@ -73,6 +76,17 @@ class PersistentMemoryStore:
             else:
                 after = after.rstrip() + f"\n{bullet}\n"
             content = parts[0] + header + after
+        if section_name == "Environment":
+            section_body = self._extract_section(content, section_name)
+            bullets = [line for line in section_body.splitlines() if line.strip().startswith("-")]
+            if len(bullets) > 5:
+                trimmed = "\n".join(bullets[-5:])
+                content = re.sub(
+                    rf"(## Environment\s*\n)(.*?)(?=\n##\s+\w+|\Z)",
+                    rf"\1\n{trimmed}\n",
+                    content,
+                    flags=re.DOTALL,
+                )
         atomic_write_text(path, content)
         return True
 

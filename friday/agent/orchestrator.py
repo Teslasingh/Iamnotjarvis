@@ -6,6 +6,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 from friday.agent.loop import run_agent_turn
+from friday.agent.plan import PlanStep, normalize_plan
 from friday.agent.turn_context import AgentExtras
 from friday.agent.mistakes import TurnMistakeLog
 from friday.agent.soul import SoulStore
@@ -54,7 +55,7 @@ Summarize: what changed in the repo or filesystem, what validation passed, what 
 Do not mention sub-agents, orchestration, or internal workflow."""
 
 
-def _subagent_failed(reply: str) -> bool:
+def _subagent_failed(reply: str, *, mistakes: Optional[TurnMistakeLog] = None) -> bool:
     text = (reply or "").strip()
     if not text or text == "(no content)":
         return True
@@ -62,6 +63,16 @@ def _subagent_failed(reply: str) -> bool:
     if lowered.startswith("llm error:"):
         return True
     if "max agent steps reached" in lowered:
+        return True
+    if mistakes and mistakes.has_entries() and any(
+        phrase in lowered
+        for phrase in ("completed successfully", "task complete", "nothing changed", "no action needed")
+    ):
+        return False
+    planning_only = (
+        "i will " in lowered or "i'll " in lowered or "you should " in lowered
+    ) and not any(token in lowered for token in ("verified", "exit 0", "read_file", "run_shell"))
+    if planning_only and len(text) > 120:
         return True
     return False
 
@@ -80,7 +91,7 @@ def _merge_outputs(all_outputs: List[List[Dict[str, Any]]]) -> List[Dict[str, An
 
 async def _run_subagent(
     *,
-    subtask: Dict[str, str],
+    subtask: Dict[str, Any],
     index: int,
     extra_kw: Optional[Dict[str, Any]] = None,
     user_message: str,
@@ -105,8 +116,12 @@ async def _run_subagent(
     kw = extra_kw or {}
     role = subtask.get("role", "execute")
     goal = subtask.get("goal", expanded_query)
+    step_id = str(subtask.get("id") or f"{role}_{index + 1}")
     role_prompt = _ROLE_PROMPTS.get(role, _ROLE_PROMPTS["execute"])
-    sub_brief = task_brief + f"\n\nSub-agent goal ({role}): {goal}"
+    sub_brief = task_brief + f"\n\nPlan step {step_id} ({role}): {goal}"
+    success = subtask.get("success_criteria") or []
+    if success:
+        sub_brief += "\nStep success criteria:\n" + "\n".join(f"- {item}" for item in success)
     if retry_context:
         sub_brief += f"\n\nPrevious attempt failed:\n{retry_context}"
 
@@ -115,6 +130,7 @@ async def _run_subagent(
             "type": "subagent_start",
             "role": role,
             "index": index,
+            "step_id": step_id,
             "goal": goal[:500],
             "client_id": client_id,
         }
@@ -148,12 +164,13 @@ async def _run_subagent(
         **kw,
     )
 
-    failed = _subagent_failed(reply)
+    failed = _subagent_failed(reply, mistakes=mistakes)
     await bus.publish(
         {
             "type": "subagent_complete",
             "role": role,
             "index": index,
+            "step_id": step_id,
             "failed": failed,
             "client_id": client_id,
         }
@@ -202,6 +219,141 @@ async def _synthesize_reply(
         return str(last or "Task completed with partial results.")
 
 
+def _plan_from_analysis(analysis: Dict[str, Any], settings: Settings):
+    return normalize_plan(
+        {"plan": analysis.get("plan") or {}, "subtasks": analysis.get("subtasks") or []},
+        intent=str(analysis.get("intent") or ""),
+        expanded_query=str(analysis.get("expanded_query") or ""),
+        subtasks=list(analysis.get("subtasks") or []),
+        success_criteria=list(analysis.get("success_criteria") or []),
+        max_steps=settings.multi_agent_max_plan_steps,
+    )
+
+
+def _reports_context(reports: List[Dict[str, Any]]) -> str:
+    chunks: List[str] = []
+    for report in reports:
+        role = report.get("role", "agent")
+        step_id = report.get("id", role)
+        goal = report.get("goal", "")
+        reply = report.get("reply", "")
+        failed = " failed" if report.get("failed") else ""
+        chunks.append(f"[{step_id}:{role}{failed}] {goal}\n{reply}")
+    return "\n\n".join(chunks)
+
+
+async def _run_plan_step(
+    *,
+    step: PlanStep,
+    index: int,
+    extra_kw: Dict[str, Any],
+    user_message: str,
+    expanded_query: str,
+    task_brief: str,
+    prior_context: str,
+    llm: LLMClient,
+    bus: EventBus,
+    sessions: SessionManager,
+    workdir: str,
+    allow_shell: bool,
+    settings: Settings,
+    memory_context: str,
+    soul_context: str,
+    attachments: Optional[List[Dict[str, Any]]],
+    session_uploads: Optional[List[Dict[str, Any]]],
+    file_registry: Optional[FileRegistry],
+    soul_store: Optional[SoulStore],
+    client_id: Optional[str],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], TurnMistakeLog]:
+    subtask = step.to_dict()
+    await bus.publish(
+        {
+            "type": "plan_step_started",
+            "step_id": step.id,
+            "role": step.role,
+            "goal": step.goal[:500],
+            "client_id": client_id,
+        }
+    )
+    reply, outputs, failed, mistakes = await _run_subagent(
+        subtask=subtask,
+        index=index,
+        extra_kw=extra_kw,
+        user_message=user_message,
+        expanded_query=expanded_query,
+        task_brief=task_brief,
+        prior_context=prior_context,
+        llm=llm,
+        bus=bus,
+        sessions=sessions,
+        workdir=workdir,
+        allow_shell=allow_shell,
+        settings=settings,
+        memory_context=memory_context,
+        soul_context=soul_context,
+        attachments=attachments,
+        session_uploads=session_uploads,
+        file_registry=file_registry,
+        soul_store=soul_store,
+        client_id=client_id,
+    )
+    if failed:
+        await bus.publish(
+            {
+                "type": "plan_step_retry",
+                "step_id": step.id,
+                "role": step.role,
+                "client_id": client_id,
+            }
+        )
+        reply, outputs, failed, retry_mistakes = await _run_subagent(
+            subtask=subtask,
+            index=index,
+            extra_kw=extra_kw,
+            user_message=user_message,
+            expanded_query=expanded_query,
+            task_brief=task_brief,
+            prior_context=prior_context,
+            llm=llm,
+            bus=bus,
+            sessions=sessions,
+            workdir=workdir,
+            allow_shell=allow_shell,
+            settings=settings,
+            memory_context=memory_context,
+            soul_context=soul_context,
+            attachments=attachments,
+            session_uploads=session_uploads,
+            file_registry=file_registry,
+            soul_store=soul_store,
+            client_id=client_id,
+            retry_context=reply,
+        )
+        mistakes.merge(retry_mistakes)
+        if retry_mistakes.step_budget_exhausted:
+            mistakes.step_budget_exhausted = True
+
+    event_type = "plan_step_failed" if failed else "plan_step_complete"
+    await bus.publish(
+        {
+            "type": event_type,
+            "step_id": step.id,
+            "role": step.role,
+            "failed": failed,
+            "client_id": client_id,
+        }
+    )
+    report = {
+        "id": step.id,
+        "role": step.role,
+        "goal": step.goal,
+        "reply": reply,
+        "failed": failed,
+        "depends_on": step.depends_on,
+    }
+    return report, outputs, mistakes
+
+
 async def run_orchestrated_turn(
     user_message: str,
     llm: LLMClient,
@@ -236,7 +388,8 @@ async def run_orchestrated_turn(
     expanded_query = str(analysis.get("expanded_query") or user_message).strip()
     task_brief = build_task_brief(analysis)
     orchestrate = bool(analysis.get("orchestrate")) and settings.multi_agent_enabled
-    subtasks: List[Dict[str, str]] = list(analysis.get("subtasks") or [])
+    plan = _plan_from_analysis(analysis, settings)
+    subtasks: List[Dict[str, str]] = plan.subtasks()
 
     if not orchestrate or not subtasks:
         return await run_agent_turn(
@@ -266,86 +419,63 @@ async def run_orchestrated_turn(
         {
             "type": "orchestration_start",
             "subtasks": len(subtasks),
+            "plan": plan.to_dict(),
             "complexity": analysis.get("complexity"),
             "client_id": client_id,
         }
     )
+    await bus.publish(
+        {
+            "type": "plan_created",
+            "plan": plan.to_dict(),
+            "client_id": client_id,
+        }
+    )
 
-    prior_context = ""
     reports: List[Dict[str, Any]] = []
     all_outputs: List[List[Dict[str, Any]]] = []
     turn_mistakes = TurnMistakeLog()
-
-    for index, subtask in enumerate(subtasks):
-        reply, outputs, failed, mistakes = await _run_subagent(
-            subtask=subtask,
-            index=index,
-            extra_kw=extra_kw,
-            user_message=user_message,
-            expanded_query=expanded_query,
-            task_brief=task_brief,
-            prior_context=prior_context,
-            llm=llm,
-            bus=bus,
-            sessions=sessions,
-            workdir=workdir,
-            allow_shell=allow_shell,
-            settings=settings,
-            memory_context=memory_context,
-            soul_context=soul_context,
-            attachments=attachments,
-            session_uploads=session_uploads,
-            file_registry=file_registry,
-            soul_store=soul_store,
-            client_id=client_id,
+    max_parallel = (
+        settings.multi_agent_max_parallel_steps
+        if settings.multi_agent_parallel_enabled
+        else 1
+    )
+    step_index = {step.id: idx for idx, step in enumerate(plan.steps)}
+    for batch in plan.batches(max_parallel):
+        prior_context = _reports_context(reports)
+        results = await asyncio.gather(
+            *[
+                _run_plan_step(
+                    step=step,
+                    index=step_index.get(step.id, 0),
+                    extra_kw=extra_kw,
+                    user_message=user_message,
+                    expanded_query=expanded_query,
+                    task_brief=task_brief,
+                    prior_context=prior_context,
+                    llm=llm,
+                    bus=bus,
+                    sessions=sessions,
+                    workdir=workdir,
+                    allow_shell=allow_shell,
+                    settings=settings,
+                    memory_context=memory_context,
+                    soul_context=soul_context,
+                    attachments=attachments,
+                    session_uploads=session_uploads,
+                    file_registry=file_registry,
+                    soul_store=soul_store,
+                    client_id=client_id,
+                )
+                for step in batch
+            ]
         )
-
-        turn_mistakes.merge(mistakes)
-        if mistakes.step_budget_exhausted:
-            turn_mistakes.step_budget_exhausted = True
-
-        if failed:
-            await bus.publish(
-                {
-                    "type": "subagent_retry",
-                    "role": subtask.get("role"),
-                    "index": index,
-                    "client_id": client_id,
-                }
-            )
-            reply, outputs, _, retry_mistakes = await _run_subagent(
-                subtask=subtask,
-                index=index,
-                extra_kw=extra_kw,
-                user_message=user_message,
-                expanded_query=expanded_query,
-                task_brief=task_brief,
-                prior_context=prior_context,
-                llm=llm,
-                bus=bus,
-                sessions=sessions,
-                workdir=workdir,
-                allow_shell=allow_shell,
-                settings=settings,
-                memory_context=memory_context,
-                soul_context=soul_context,
-                attachments=attachments,
-                session_uploads=session_uploads,
-                file_registry=file_registry,
-                soul_store=soul_store,
-                client_id=client_id,
-                retry_context=reply,
-            )
-
-            turn_mistakes.merge(retry_mistakes)
-            if retry_mistakes.step_budget_exhausted:
+        for report, outputs, mistakes in results:
+            turn_mistakes.merge(mistakes)
+            if mistakes.step_budget_exhausted:
                 turn_mistakes.step_budget_exhausted = True
-
-        role = subtask.get("role", "execute")
-        goal = subtask.get("goal", "")
-        reports.append({"role": role, "goal": goal, "reply": reply})
-        all_outputs.append(outputs)
-        prior_context += f"\n\n[{role}] {goal}\n{reply}"
+            reports.append(report)
+            all_outputs.append(outputs)
 
     final_reply = await _synthesize_reply(llm, settings, user_message, reports)
     merged_outputs = _merge_outputs(all_outputs)
@@ -354,6 +484,14 @@ async def run_orchestrated_turn(
         {
             "type": "orchestration_complete",
             "subtasks": len(subtasks),
+            "client_id": client_id,
+        }
+    )
+    await bus.publish(
+        {
+            "type": "plan_complete",
+            "steps": len(plan.steps),
+            "failed": sum(1 for report in reports if report.get("failed")),
             "client_id": client_id,
         }
     )

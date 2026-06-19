@@ -31,6 +31,18 @@ from friday.scheduler.worker import CronWorker
 from friday.config import Settings, get_settings
 from friday.events.bus import EventBus
 from friday.llm.usage import TokenUsageStore
+from friday.paths import (
+    BASE_DIR,
+    BATCHES_DIR,
+    CHECKPOINTS_DIR,
+    CONVERSATION_FILE,
+    CRON_JOBS_FILE,
+    FILE_REGISTRY_FILE,
+    HOOKS_FILE,
+    SOUL_FILE,
+    TASK_FILE,
+    TOKEN_USAGE_FILE,
+)
 from friday.runtime.files import FileRegistry, guess_mime, is_path_under, is_preview_image, normalize_rel_path, sanitize_filename
 from friday.runtime.sessions import SessionManager
 from friday.runtime.watchdog import JobWatchdog
@@ -66,7 +78,7 @@ def _is_ws_authenticated(websocket: WebSocket, settings: Settings) -> bool:
 
 
 def _workdir_path(settings: Settings) -> Path:
-    return Path(settings.agent_workdir).resolve()
+    return Path(settings.agent_workdir).resolve() if settings.agent_workdir else BASE_DIR.resolve()
 
 
 def _uploads_root(settings: Settings) -> Path:
@@ -144,9 +156,9 @@ class HookBody(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    workdir = settings.agent_workdir
-    workdir_path = Path(workdir)
-    hook_registry = HookRegistry(workdir_path / ".friday" / "hooks.json")
+    workdir_path = _workdir_path(settings)
+    workdir = str(workdir_path)
+    hook_registry = HookRegistry(HOOKS_FILE)
     hook_runner = HookRunner(
         hook_registry, timeout_seconds=settings.hooks_webhook_timeout_seconds
     )
@@ -156,30 +168,30 @@ async def lifespan(app: FastAPI):
         hooks_enabled=settings.hooks_enabled,
     )
     workdir_path.mkdir(parents=True, exist_ok=True)
-    (_workdir_path(settings) / settings.upload_dir).mkdir(parents=True, exist_ok=True)
-    (_workdir_path(settings) / settings.output_dir).mkdir(parents=True, exist_ok=True)
+    (workdir_path / settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    (workdir_path / settings.output_dir).mkdir(parents=True, exist_ok=True)
     sessions = SessionManager(bus=bus, default_cwd=workdir, settings=settings)
-    friday_dir = workdir_path / ".friday"
     memory = MemoryStore(
         recent_turns=settings.conversation_memory_max_turns,
-        persist_path=friday_dir / "conversation.json",
+        persist_path=CONVERSATION_FILE,
         max_context_chars=settings.conversation_memory_max_context_chars,
         persist_enabled=settings.conversation_memory_enabled,
+        skip_autonomous_in_context=settings.conversation_memory_skip_autonomous,
     )
     if not settings.conversation_memory_enabled:
         memory.clear()
-    soul = SoulStore(workdir_path / "soul.md")
+    soul = SoulStore(SOUL_FILE)
     soul.load()
     persistent_memory = PersistentMemoryStore(workdir_path)
     checkpoint_manager = CheckpointManager(
-        friday_dir / "checkpoints",
+        CHECKPOINTS_DIR,
         workdir_path,
         settings.checkpoints_max_count,
         settings.checkpoints_max_file_bytes,
     )
     usage = TokenUsageStore(
         call_log_max=settings.token_usage_call_log_max,
-        persist_path=friday_dir / "token_usage.json",
+        persist_path=TOKEN_USAGE_FILE,
         persist_enabled=settings.token_usage_enabled and settings.token_usage_persist,
     )
     app.state.settings = settings
@@ -191,8 +203,7 @@ async def lifespan(app: FastAPI):
     app.state.checkpoint_manager = checkpoint_manager
     app.state.hook_registry = hook_registry
     app.state.usage = usage
-    registry_path = workdir_path / ".friday" / "file_registry.json"
-    registry = FileRegistry(registry_path, workdir_path)
+    registry = FileRegistry(FILE_REGISTRY_FILE, workdir_path)
     registry.register_existing_paths(workdir_path, [settings.upload_dir, settings.output_dir])
     app.state.file_registry = registry
     watchdog = JobWatchdog(sessions=sessions, bus=bus, settings=settings)
@@ -208,7 +219,7 @@ async def lifespan(app: FastAPI):
         soul=soul,
         usage=usage,
         registry=registry,
-        queue_path=friday_dir / "task_queue.json",
+        queue_path=TASK_FILE,
         watchdog=watchdog,
         checkpoint_manager=checkpoint_manager,
         persistent_memory=persistent_memory,
@@ -217,7 +228,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.autonomy = autonomy
 
-    cron_store = CronStore(friday_dir / "cron_jobs.json", settings.cron_max_jobs)
+    cron_store = CronStore(CRON_JOBS_FILE, settings.cron_max_jobs)
     app.state.cron_store = cron_store
 
     async def _cron_enqueue(prompt: str, meta: dict) -> None:
@@ -256,7 +267,7 @@ async def lifespan(app: FastAPI):
         return reply, outputs, mistakes
 
     batch_runner = BatchRunner(
-        friday_dir / "batches",
+        BATCHES_DIR,
         _batch_run_turn,
         settings.batch_max_parallel,
         settings.batch_max_items,

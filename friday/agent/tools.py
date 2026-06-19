@@ -20,6 +20,7 @@ import httpx
 
 from friday.config import Settings
 from friday.events.bus import EventBus
+from friday.paths import BASE_DIR, FRIDAY_DIR, TASK_FILE
 from friday.agent.checkpoints import CheckpointManager
 from friday.agent.persistent_memory import PersistentMemoryStore, mirror_remember_soul
 from friday.agent.skills import SkillEntry, load_skill_body
@@ -814,6 +815,32 @@ async def _maybe_checkpoint(ctx: ToolContext, tool: str, path: Path) -> None:
         ctx.checkpoint_manager.snapshot_before(tool, [path])
 
 
+def _looks_like_long_running_server(command: str) -> bool:
+    lower = str(command or "").lower()
+    markers = (
+        "npm run",
+        "pnpm run",
+        "pnpm dev",
+        "yarn dev",
+        "yarn start",
+        "uvicorn",
+        "gunicorn",
+        "flask run",
+        "manage.py runserver",
+        "webpack serve",
+        "vite",
+        "next dev",
+        "nuxt dev",
+        "python -m http.server",
+        "streamlit run",
+        "gradio",
+        "jupyter notebook",
+        "jupyter lab",
+        " --watch",
+    )
+    return any(marker in lower for marker in markers)
+
+
 async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> str:
     await ctx.bus.publish({"type": "tool_call", "tool": name, "args": arguments})
     if ctx.hook_runner:
@@ -825,6 +852,17 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
         if not ctx.allow_shell:
             return json.dumps({"error": "shell execution disabled by policy"})
         command = str(arguments.get("command", ""))
+        if _looks_like_long_running_server(command):
+            return json.dumps(
+                {
+                    "error": "long_running_command",
+                    "message": (
+                        "This command looks like a long-running server or watcher. "
+                        "Use start_shell_job (omit timeout) instead of run_shell."
+                    ),
+                    "command": command,
+                }
+            )
         cwd = arguments.get("cwd") or ctx.workdir
         result = await ctx.sessions.run_command(
             command,
@@ -1136,6 +1174,9 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
             "python": platform.python_version(),
             "cwd": os.getcwd(),
             "agent_workdir": ctx.workdir,
+            "base_dir": str(BASE_DIR.resolve()),
+            "friday_dir": str(FRIDAY_DIR.resolve()),
+            "task_queue_path": str(TASK_FILE.resolve()),
             "upload_dir": ctx.settings.upload_dir,
             "output_dir": ctx.settings.output_dir,
             "home": str(Path.home()),
@@ -1351,6 +1392,18 @@ async def execute_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -
         if not text:
             return json.dumps({"error": "empty text"})
         section = str(arguments.get("section") or "learnings").strip()
+        if ctx.autonomy_turn_source in {"job_followup", "continuation", "cron"}:
+            section_key = section.lower()
+            if section_key in {"learnings", "learning", "environment", "env"}:
+                return json.dumps(
+                    {
+                        "error": "remember_soul_blocked",
+                        "message": (
+                            "Do not persist Learnings/Environment during autonomous "
+                            "follow-up or continuation turns."
+                        ),
+                    }
+                )
         ok = ctx.soul_store.append_bullet(section, text)
         if not ok:
             return json.dumps({"error": "failed to save soul memory"})

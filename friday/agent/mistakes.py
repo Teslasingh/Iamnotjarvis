@@ -55,8 +55,11 @@ def extract_shell_mistake(result: str) -> Optional[str]:
         payload = json.loads(result)
     except json.JSONDecodeError:
         return None
+    if payload.get("error") == "repeated_tool_call":
+        return str(payload.get("message") or "repeated tool call")
     if payload.get("error"):
-        return f"run_shell error: {payload['error']}"
+        cmd = str(payload.get("command") or payload.get("cmd") or "shell command").strip()
+        return f"shell error ({cmd}): {payload['error']}"
     if not shell_run_failed(result):
         return None
     cmd = str(payload.get("command") or payload.get("cmd") or "shell command").strip()
@@ -64,11 +67,11 @@ def extract_shell_mistake(result: str) -> Optional[str]:
     summary = str(outcome.get("summary") or "").strip()
     stderr = str(payload.get("stderr") or "").strip()
     detail = summary or stderr[:240] or f"exit {payload.get('return_code', '?')}"
-    return f"run_shell failed ({cmd}): {detail}"
+    return f"shell failed ({cmd}): {detail}"
 
 
 def extract_tool_mistake(name: str, result: str) -> Optional[str]:
-    if name == "run_shell":
+    if name in {"run_shell", "start_shell_job", "get_shell_job"}:
         return extract_shell_mistake(result)
     try:
         payload = json.loads(result)
@@ -97,7 +100,7 @@ def record_tool_outcome(log: TurnMistakeLog, name: str, args: Dict[str, Any], re
     if mistake:
         log.record(mistake)
         return
-    if name == "run_shell" and shell_run_failed(result):
+    if name in {"run_shell", "get_shell_job"} and shell_run_failed(result):
         fallback = extract_shell_mistake(result)
         if fallback:
             log.record(fallback)

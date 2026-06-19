@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+
+from friday.paths import BASE_DIR
 
 
 def _env(name: str, default: str = "") -> str:
@@ -42,6 +47,24 @@ def _normalize_azure_endpoint(value: str) -> str:
     return text
 
 
+def _normalize_agent_workdir(raw: str) -> str:
+    """Resolve AGENT_WORKDIR to a native absolute path for the OS running Python."""
+    text = (raw or os.getcwd()).strip() or os.getcwd()
+    if sys.platform == "win32":
+        return os.path.abspath(text)
+    win = re.match(r"^([A-Za-z]):[/\\](.*)$", text)
+    if win:
+        drive = win.group(1).lower()
+        rest = win.group(2).replace("\\", "/").strip("/")
+        wsl = f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+        if os.path.isdir(wsl):
+            return str(Path(wsl).resolve())
+    path = Path(text)
+    if path.is_absolute():
+        return str(path.resolve())
+    return os.path.abspath(text)
+
+
 @dataclass(frozen=True)
 class Settings:
     azure_openai_endpoint: str
@@ -76,6 +99,9 @@ class Settings:
     task_analysis_enabled: bool
     multi_agent_enabled: bool
     multi_agent_max_subagents: int
+    multi_agent_max_plan_steps: int
+    multi_agent_parallel_enabled: bool
+    multi_agent_max_parallel_steps: int
     multi_agent_subagent_max_steps: int
     multi_agent_synthesis_max_chars: int
     conversation_memory_enabled: bool
@@ -92,7 +118,11 @@ class Settings:
     autonomy_auto_continue: bool
     autonomy_job_followup: bool
     autonomy_job_followup_max_pending: int
+    autonomy_job_followup_max_per_root: int
+    autonomy_continue_user_only: bool
     autonomy_queue_user_tasks: bool
+    conversation_memory_skip_autonomous: bool
+    soul_auto_update_skip_autonomous: bool
     autonomy_watchdog_enabled: bool
     autonomy_watchdog_poll_seconds: int
     autonomy_job_max_runtime_seconds: int
@@ -151,7 +181,7 @@ def get_settings() -> Settings:
         azure_openai_api_version=_env("OPENAI_API_VERSION", "2024-12-01-preview"),
         host=_env("HOST", "0.0.0.0"),
         port=_int_env("PORT", 80),
-        agent_workdir=os.path.abspath(_env("AGENT_WORKDIR") or os.getcwd()),
+        agent_workdir=_normalize_agent_workdir(_env("AGENT_WORKDIR") or str(BASE_DIR)),
         allow_shell=_env("ALLOW_SHELL", "true").lower() in {"1", "true", "yes", "on", "y"},
         max_agent_steps=_int_env("MAX_AGENT_STEPS", 32),
         llm_timeout_seconds=_int_env("LLM_TIMEOUT_SECONDS", 90),
@@ -182,6 +212,12 @@ def get_settings() -> Settings:
         multi_agent_enabled=_env("MULTI_AGENT_ENABLED", "true").lower()
         in {"1", "true", "yes", "on", "y"},
         multi_agent_max_subagents=_int_env("MULTI_AGENT_MAX_SUBAGENTS", 3),
+        multi_agent_max_plan_steps=max(
+            1,
+            _int_env("MULTI_AGENT_MAX_PLAN_STEPS", _int_env("MULTI_AGENT_MAX_SUBAGENTS", 3)),
+        ),
+        multi_agent_parallel_enabled=_bool_env("MULTI_AGENT_PARALLEL_ENABLED", True),
+        multi_agent_max_parallel_steps=max(1, _int_env("MULTI_AGENT_MAX_PARALLEL_STEPS", 3)),
         multi_agent_subagent_max_steps=_int_env("MULTI_AGENT_SUBAGENT_MAX_STEPS", 16),
         multi_agent_synthesis_max_chars=_int_env("MULTI_AGENT_SYNTHESIS_MAX_CHARS", 12000),
         conversation_memory_enabled=_env("CONVERSATION_MEMORY_ENABLED", "true").lower()
@@ -193,6 +229,8 @@ def get_settings() -> Settings:
         conversation_memory_max_context_chars=_int_env("CONVERSATION_MEMORY_MAX_CONTEXT_CHARS", 12000),
         conversation_memory_clear_on_logout=_env("CONVERSATION_MEMORY_CLEAR_ON_LOGOUT", "false").lower()
         in {"1", "true", "yes", "on", "y"},
+        conversation_memory_skip_autonomous=_bool_env("CONVERSATION_MEMORY_SKIP_AUTONOMOUS", True),
+        soul_auto_update_skip_autonomous=_bool_env("SOUL_AUTO_UPDATE_SKIP_AUTONOMOUS", True),
         token_usage_enabled=_env("TOKEN_USAGE_ENABLED", "true").lower() in {"1", "true", "yes", "on", "y"},
         token_usage_persist=_env("TOKEN_USAGE_PERSIST", "true").lower() in {"1", "true", "yes", "on", "y"},
         token_usage_call_log_max=_int_env("TOKEN_USAGE_CALL_LOG_MAX", 200),
@@ -206,6 +244,8 @@ def get_settings() -> Settings:
         autonomy_job_followup=_env("AUTONOMY_JOB_FOLLOWUP", "true").lower()
         in {"1", "true", "yes", "on", "y"},
         autonomy_job_followup_max_pending=max(1, _int_env("AUTONOMY_JOB_FOLLOWUP_MAX_PENDING", 1)),
+        autonomy_job_followup_max_per_root=max(0, _int_env("AUTONOMY_JOB_FOLLOWUP_MAX_PER_ROOT", 2)),
+        autonomy_continue_user_only=_bool_env("AUTONOMY_CONTINUE_USER_ONLY", True),
         autonomy_queue_user_tasks=_env("AUTONOMY_QUEUE_USER_TASKS", "true").lower()
         in {"1", "true", "yes", "on", "y"},
         autonomy_watchdog_enabled=_env("AUTONOMY_WATCHDOG_ENABLED", "true").lower()

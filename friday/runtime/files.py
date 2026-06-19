@@ -45,7 +45,12 @@ def is_path_under(base: Path, target: Path) -> bool:
 
 
 def workdir_relative(workdir: Path, path: Path) -> str:
-    return normalize_rel_path(str(path.resolve().relative_to(workdir.resolve())))
+    resolved = path.resolve()
+    base = workdir.resolve()
+    try:
+        return normalize_rel_path(str(resolved.relative_to(base)))
+    except ValueError:
+        return str(resolved)
 
 
 def guess_mime(path: Path) -> str:

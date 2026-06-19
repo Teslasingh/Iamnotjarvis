@@ -25,6 +25,22 @@
       </header>
       <main class="grid">
         <aside class="rail" id="jobs-rail">
+          <div class="mission-panel">
+            <div class="rail-head">
+              <div class="rail-head-title">
+                <div class="panel-title">Mission</div>
+                <span id="autonomy-summary" class="job-count-badge hidden" aria-live="polite"></span>
+              </div>
+              <div class="rail-head-actions">
+                <button type="button" class="btn ghost small-btn" id="btn-clear-tasks" title="Clear completed tasks">
+                  Clear done
+                </button>
+              </div>
+            </div>
+            <div id="plan-card" class="plan-card empty">No active plan</div>
+            <ul id="task-list" class="list task-list"></ul>
+          </div>
+          <div class="rail-divider"></div>
           <div class="rail-head">
             <div class="rail-head-title">
               <div class="panel-title">Shell jobs</div>
