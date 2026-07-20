@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gmail Job Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>AI Job Email Assistant</h1>
+      <p>Upload your resume, set your agent prompt, and open the app to auto-sync inbox mail.</p>
+    </div>
+    <a class="button secondary" id="connect-gmail" href="/auth/start">Connect Gmail</a>
+  </header>
+
+  <main class="dashboard">
+    <div class="workspace" id="workspace">
+      <div class="workspace-col" id="sidebar-col">
+        <div class="sidebar-column" id="sidebar-panel">
+    <section class="panel setup">
+      <h2>Setup</h2>
+      <div id="status" class="status-grid"></div>
+      <div class="profile-summary">
+        <h3>Profile</h3>
+        <p id="profile-summary-text">Upload a resume to build your profile.</p>
+      </div>
+      <form id="profile-form" class="profile-form">
+        <div class="two-col">
+          <label>Full name<input name="full_name" /></label>
+          <label>Email<input name="email" /></label>
+        </div>
+        <label>Skills<textarea name="skills" placeholder="Key skills for AI comparison"></textarea></label>
+        <label>Job preferences<textarea name="job_preferences" placeholder="Optional"></textarea></label>
+        <div id="saved-resume-info" class="saved-resume-info"></div>
+        <label>Resume file<input name="resume" type="file" /></label>
+        <button class="button" type="submit">Save Profile</button>
+      </form>
+    </section>
+
+    <section class="panel agent-prompt">
+      <h2>Agent Prompt</h2>
+      <p class="panel-hint">The agent uses this prompt to classify mail and compare it against your profile.</p>
+      <textarea id="agent-prompt" rows="10" placeholder="Enter agent instructions..."></textarea>
+      <div class="actions">
+        <button class="button" id="save-agent-prompt" type="button">Save Prompt</button>
+        <button class="button secondary" id="reset-agent-prompt" type="button">Reset to Default</button>
+      </div>
+    </section>
+        </div>
+      </div>
+
+      <div class="resize-handle" data-target="sidebar" title="Drag to resize sidebar"></div>
+
+      <div class="workspace-col" id="inbox-col">
+    <section class="panel inbox" id="inbox-panel">
+      <div class="section-header">
+        <div class="section-header-copy">
+          <h2>Mail Scanner</h2>
+          <p id="sync-status" class="panel-hint">Loading inbox from the last 30 days...</p>
+        </div>
+        <button class="button" id="sync-button" type="button">Sync</button>
+      </div>
+
+      <details class="sync-panel" id="sync-panel" open>
+        <summary>Sync progress</summary>
+        <div class="sync-progress-wrap">
+          <div class="sync-progress-meta">
+            <strong id="sync-progress-percent">0%</strong>
+            <span id="sync-progress-stage">Ready</span>
+          </div>
+          <div class="sync-progress-bar" aria-hidden="true">
+            <div class="sync-progress-fill" id="sync-progress-fill"></div>
+          </div>
+          <p id="sync-progress-message" class="sync-progress-message">Waiting to sync...</p>
+        </div>
+      </details>
+
+      <div class="inbox-body">
+        <div class="mail-toolbar">
+          <label>Sort by
+            <select id="sort-emails">
+              <option value="recent">Recent mail</option>
+              <option value="match">Highest match %</option>
+              <option value="relevance">Most relevant</option>
+            </select>
+          </label>
+          <button class="button secondary compact" id="reset-layout-button" type="button">Reset layout</button>
+        </div>
+
+        <div id="email-list" class="email-list"></div>
+      </div>
+    </section>
+      </div>
+
+      <div class="resize-handle" data-target="inbox" title="Drag to resize mail scanner"></div>
+
+      <div class="workspace-col workspace-col-grow" id="detail-col">
+    <section class="panel detail" id="detail-panel">
+      <div id="detail-empty" class="empty detail-empty">Select an email to review.</div>
+      <article id="email-detail" class="hidden">
+        <div class="detail-sticky">
+          <div class="section-header">
+            <div>
+              <h2 id="detail-subject"></h2>
+              <p id="detail-meta"></p>
+            </div>
+          </div>
+
+          <div class="actions detail-actions">
+            <button class="button secondary" id="reanalyze-button" type="button">Re-analyze</button>
+            <button class="button" id="draft-button" type="button">Generate Draft</button>
+            <button class="button secondary" id="archive-button" type="button">Archive</button>
+          </div>
+        </div>
+
+        <div id="match-overview" class="match-overview"></div>
+
+        <h3>AI Analysis</h3>
+        <div id="analysis" class="analysis"></div>
+
+        <div class="email-section-header">
+          <h3>Original Email</h3>
+          <div class="email-view-toggle" id="email-view-toggle" hidden>
+            <button type="button" class="toggle-btn active" data-view="html">Formatted</button>
+            <button type="button" class="toggle-btn" data-view="text">Plain text</button>
+          </div>
+        </div>
+        <div id="email-body" class="email-body" tabindex="0"></div>
+
+        <h3>Draft Reply</h3>
+        <div id="draft-panel" class="draft-panel hidden">
+          <div id="draft-sent-banner" class="draft-sent-banner hidden">
+            <strong>Reply sent</strong>
+            <span id="draft-sent-time"></span>
+          </div>
+          <label>Subject<input id="draft-subject" /></label>
+          <label>Body<textarea id="draft-body"></textarea></label>
+          <label class="checkbox" id="draft-attach-label"><input id="draft-attach-resume" type="checkbox" /> Attach uploaded resume</label>
+          <div class="actions" id="draft-actions">
+            <button class="button secondary" id="save-draft-button" type="button">Save Draft</button>
+            <button class="button danger" id="send-button" type="button">Approve & Send</button>
+          </div>
+        </div>
+        <div id="draft-empty" class="empty">No draft yet.</div>
+      </article>
+    </section>
+      </div>
+    </div>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -14,3 +14,29 @@ soul.md
 *.db
 *.db-shm
 *.db-wal
+
+# --- Secrets & credentials (never commit) ---
+client_secret*.json
+token.json
+*_secret*.json
+*oauth*.json
+
+# --- Runtime data containing PII / local state ---
+email_agent/data/profile.json
+email_agent/data/email_agent.sqlite3
+email_agent/data/token.json
+# Keep the data/ folder in git but ignore its runtime contents:
+!email_agent/data/.gitkeep
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Large model weights / caches ---
+WOP/models/
+**/.cache/
+*.bin
+*.safetensors
+*.gguf

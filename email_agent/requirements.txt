@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+openai
+pydantic
+pypdf
+python-docx

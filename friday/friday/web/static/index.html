@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Friday</title>
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="top">
+        <div class="brand">
+          <span class="dot"></span>
+          <span>Friday</span>
+          <span class="sub">agent · autonomous</span>
+        </div>
+        <div class="status" id="status">Idle</div>
+        <div class="actions">
+          <form method="post" action="/logout" class="logout-form">
+            <button type="submit" class="btn ghost small-btn">Logout</button>
+          </form>
+          <button type="button" class="btn ghost small-btn" id="btn-clear-log">Clear log</button>
+        </div>
+      </header>
+      <main class="grid">
+        <aside class="rail" id="jobs-rail">
+          <div class="mission-panel">
+            <div class="rail-head">
+              <div class="rail-head-title">
+                <div class="panel-title">Mission</div>
+                <span id="autonomy-summary" class="job-count-badge hidden" aria-live="polite"></span>
+              </div>
+              <div class="rail-head-actions">
+                <button type="button" class="btn ghost small-btn" id="btn-clear-tasks" title="Clear mission list (does not stop running work)">
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div id="plan-card" class="plan-card empty">No active mission</div>
+            <ul id="task-list" class="list task-list"></ul>
+          </div>
+          <div class="rail-divider"></div>
+          <div class="rail-head">
+            <div class="rail-head-title">
+              <div class="panel-title">Shell jobs</div>
+              <span id="job-count-badge" class="job-count-badge hidden" aria-live="polite"></span>
+            </div>
+            <div class="rail-head-actions">
+              <button type="button" class="btn ghost small-btn" id="btn-clear-jobs" title="Clear list (does not stop processes)">
+                Clear
+              </button>
+            </div>
+          </div>
+          <ul id="job-list" class="list job-list"></ul>
+        </aside>
+        <section class="chat">
+          <div class="panel-title">Chat</div>
+          <p class="hint muted small">
+            A Jarvis-like local agent with shell, files, web, HTTP, SQLite, memory, and self-correction tools.
+          </p>
+          <div id="chat-stream" class="messages"></div>
+          <div class="composer-wrap">
+            <div id="attachment-chips" class="attachment-chips hidden"></div>
+            <form id="chat-form" class="composer">
+              <div class="composer-input">
+                <input type="file" id="file-input" class="file-input-hidden" multiple />
+                <button type="button" class="btn ghost small-btn" id="btn-attach" title="Attach files">Attach</button>
+                <textarea id="chat-input" rows="3" placeholder="Ask Friday… Use @path, @diff, or @https://… for context. /rollback to undo file edits."></textarea>
+              </div>
+              <button type="submit" class="btn primary" id="btn-send">Send</button>
+            </form>
+          </div>
+        </section>
+        <section class="log">
+          <div class="panel-title">Event log</div>
+          <pre id="event-log" class="event-log"></pre>
+        </section>
+      </main>
+    </div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
