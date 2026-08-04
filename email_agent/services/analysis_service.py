@@ -91,6 +91,8 @@ def analyze_all_pending(
                         percent,
                         "analyze",
                         f"Analyzing emails ({analyzed}/{pending_total})...",
+                        analyzed=analyzed,
+                        pending_total=pending_total,
                     )
             except Exception as exc:  # noqa: BLE001
                 message = getattr(exc, "message", str(exc))

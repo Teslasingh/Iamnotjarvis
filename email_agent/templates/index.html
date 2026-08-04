@@ -26,7 +26,10 @@
       <h2>Setup</h2>
       <div id="status" class="status-grid"></div>
       <div class="profile-summary">
-        <h3>Profile</h3>
+        <div class="profile-summary-head">
+          <h3>Profile</h3>
+          <button class="button secondary compact" id="edit-profile-button" type="button">Edit Profile</button>
+        </div>
         <p id="profile-summary-text">Upload a resume to build your profile.</p>
       </div>
       <form id="profile-form" class="profile-form">
@@ -61,7 +64,7 @@
       <div class="section-header">
         <div class="section-header-copy">
           <h2>Mail Scanner</h2>
-          <p id="sync-status" class="panel-hint">Loading inbox from the last 30 days...</p>
+          <p id="sync-status" class="panel-hint">Loading inbox...</p>
         </div>
         <button class="button" id="sync-button" type="button">Sync</button>
       </div>
@@ -77,6 +80,12 @@
             <div class="sync-progress-fill" id="sync-progress-fill"></div>
           </div>
           <p id="sync-progress-message" class="sync-progress-message">Waiting to sync...</p>
+          <div class="sync-stats" id="sync-stats">
+            <div class="sync-stat"><span class="sync-stat-value" id="sync-stat-checked">0</span><span class="sync-stat-label">Checked</span></div>
+            <div class="sync-stat"><span class="sync-stat-value" id="sync-stat-new">0</span><span class="sync-stat-label">New</span></div>
+            <div class="sync-stat"><span class="sync-stat-value" id="sync-stat-analyzed">0</span><span class="sync-stat-label">Analyzed</span></div>
+            <div class="sync-stat"><span class="sync-stat-value" id="sync-stat-pending">0</span><span class="sync-stat-label">Pending</span></div>
+          </div>
         </div>
       </details>
 
@@ -152,6 +161,42 @@
       </div>
     </div>
   </main>
+
+  <div id="profile-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
+    <div class="modal-backdrop" data-close="profile-modal"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="profile-modal-title">Edit Profile</h2>
+        <button class="modal-close" type="button" data-close="profile-modal" aria-label="Close">&times;</button>
+      </div>
+      <form id="profile-modal-form" class="profile-form modal-form">
+        <div class="two-col">
+          <label>Full name<input name="full_name" /></label>
+          <label>Email<input name="email" type="email" /></label>
+        </div>
+        <div class="two-col">
+          <label>Phone<input name="phone" /></label>
+          <label>Location<input name="location" /></label>
+        </div>
+        <div class="two-col">
+          <label>LinkedIn<input name="linkedin" placeholder="https://linkedin.com/in/..." /></label>
+          <label>Portfolio<input name="portfolio" placeholder="https://..." /></label>
+        </div>
+        <label>Summary<textarea name="summary" placeholder="Short professional summary"></textarea></label>
+        <label>Work experience<textarea name="work_experience" placeholder="Roles, companies, dates"></textarea></label>
+        <label>Skills<textarea name="skills" placeholder="Key skills for AI comparison"></textarea></label>
+        <label>Job preferences<textarea name="job_preferences" placeholder="Roles, locations, remote/onsite"></textarea></label>
+        <label>Common application details<textarea name="common_application_details" placeholder="Notice period, salary, eligibility"></textarea></label>
+        <label>Resume notes<textarea name="resume_notes" placeholder="Optional context for the agent"></textarea></label>
+        <div id="modal-saved-resume-info" class="saved-resume-info"></div>
+        <label>Resume file<input name="resume" type="file" /></label>
+        <div class="modal-actions">
+          <button class="button" type="submit" id="profile-modal-save">Save Profile</button>
+          <button class="button secondary" type="button" data-close="profile-modal">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>

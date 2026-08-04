@@ -19,6 +19,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+import requests
 
 from config import CLIENT_SECRET_FILE, OAUTH_STATE_FILE, TOKEN_FILE, ensure_directories, settings
 from constants import DEFAULT_JOB_LABEL_STATUS, JOB_LABELS
@@ -65,7 +66,7 @@ def _load_credentials() -> Credentials | None:
     if credentials and credentials.expired and credentials.refresh_token:
         try:
             with_retry(
-                lambda: credentials.refresh(Request()),
+                lambda: credentials.refresh(_timeout_request()),
                 attempts=3,
                 operation_name="gmail.token_refresh",
             )
@@ -74,6 +75,18 @@ def _load_credentials() -> Credentials | None:
             logger.warning("Gmail token refresh failed: %s", exc)
             return None
     return credentials if credentials and credentials.valid else None
+
+
+# Socket timeout (seconds) applied to every Gmail API call so a stalled
+# network connection fails fast instead of hanging the sync thread forever.
+_HTTP_TIMEOUT_SEC = 20
+
+
+def _timeout_request() -> "Request":
+    """A Google auth transport request with a socket timeout so calls fail fast."""
+    session = requests.Session()
+    session.timeout = _HTTP_TIMEOUT_SEC
+    return Request(session=session)
 
 
 def is_authorized() -> bool:
@@ -117,7 +130,17 @@ def service():
     credentials = _load_credentials()
     if not credentials:
         raise AuthorizationError()
-    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    # Use the canonical credentials-based build so googleapiclient wires up the
+    # httplib2 transport correctly. Set a socket timeout first so build_http()
+    # picks it up and stalled connections fail fast instead of hanging forever.
+    import socket
+
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_HTTP_TIMEOUT_SEC)
+    try:
+        return build("gmail", "v1", cache_discovery=False, credentials=credentials)
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 def _allow_local_http_oauth() -> None:
@@ -154,7 +177,11 @@ def _extract_query_param(url: str, name: str) -> str:
 
 
 def _execute(request: Any, *, operation_name: str) -> Any:
-    return with_retry(request.execute, attempts=3, operation_name=operation_name)
+    return with_retry(
+        lambda: request.execute(num_retries=0),
+        attempts=3,
+        operation_name=operation_name,
+    )
 
 
 def gmail_profile() -> dict[str, Any]:

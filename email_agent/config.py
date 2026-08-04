@@ -40,7 +40,7 @@ class Settings:
     azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
     azure_openai_api_version = os.getenv("OPENAI_API_VERSION", "2024-02-15-preview")
     azure_openai_deployment = os.getenv("DEPLOYMENT_NAME", "")
-    default_sync_query = os.getenv("GMAIL_SYNC_QUERY", "in:inbox newer_than:20d")
+    default_sync_query = os.getenv("GMAIL_SYNC_QUERY", "in:inbox newer_than:5d")
     default_sync_limit = int(os.getenv("GMAIL_SYNC_LIMIT", "25"))
 
     @property

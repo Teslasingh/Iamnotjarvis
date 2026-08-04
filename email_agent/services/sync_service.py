@@ -26,7 +26,18 @@ _sync_state: dict[str, Any] = {
     "message": "Ready",
     "result": None,
     "error": None,
+    "checked": 0,
+    "new": 0,
+    "analyzed": 0,
+    "pending_total": 0,
+    "total_estimate": 0,
 }
+
+# Throttle terminal progress logging so we only print meaningful updates
+# (stage changes, message changes, or a meaningful percent jump).
+_last_logged_stage: str = ""
+_last_logged_message: str = ""
+_last_logged_percent: int = -100
 
 
 def progress_snapshot() -> dict[str, Any]:
@@ -34,11 +45,45 @@ def progress_snapshot() -> dict[str, Any]:
         return dict(_sync_state)
 
 
-def set_progress(percent: int, stage: str, message: str) -> None:
+def _log_progress(percent: int, stage: str, message: str) -> None:
+    """Print a meaningful one-line progress update to the terminal."""
+    global _last_logged_stage, _last_logged_message, _last_logged_percent
+    percent_jump = abs(percent - _last_logged_percent) >= 5
+    if stage == _last_logged_stage and message == _last_logged_message and not percent_jump:
+        return
+    _last_logged_stage = stage
+    _last_logged_message = message
+    _last_logged_percent = percent
+    logger.info("[sync] %3d%% | %s | %s", percent, stage, message)
+
+
+def set_progress(
+    percent: int,
+    stage: str,
+    message: str,
+    *,
+    checked: int | None = None,
+    new: int | None = None,
+    analyzed: int | None = None,
+    pending_total: int | None = None,
+    total_estimate: int | None = None,
+) -> None:
+    percent = max(0, min(100, int(percent)))
     with _sync_lock:
-        _sync_state["percent"] = max(0, min(100, int(percent)))
+        _sync_state["percent"] = percent
         _sync_state["stage"] = stage
         _sync_state["message"] = message
+        if checked is not None:
+            _sync_state["checked"] = checked
+        if new is not None:
+            _sync_state["new"] = new
+        if analyzed is not None:
+            _sync_state["analyzed"] = analyzed
+        if pending_total is not None:
+            _sync_state["pending_total"] = pending_total
+        if total_estimate is not None:
+            _sync_state["total_estimate"] = total_estimate
+    _log_progress(percent, stage, message)
 
 
 def require_gmail_authorized() -> None:
@@ -68,9 +113,28 @@ def sync_inbox(*, analyze_new: bool = True, track_progress: bool = False) -> dic
     page_token: str | None = None
     size_estimate = 0
 
-    def progress(percent: int, stage: str, message: str) -> None:
+    def progress(
+        percent: int,
+        stage: str,
+        message: str,
+        *,
+        checked: int | None = None,
+        new: int | None = None,
+        analyzed: int | None = None,
+        pending_total: int | None = None,
+        total_estimate: int | None = None,
+    ) -> None:
         if track_progress:
-            set_progress(percent, stage, message)
+            set_progress(
+                percent,
+                stage,
+                message,
+                checked=checked,
+                new=new,
+                analyzed=analyzed,
+                pending_total=pending_total,
+                total_estimate=total_estimate,
+            )
 
     logger.info("Starting inbox sync mode=%s query=%s", mode, query)
     progress(2, "labels", "Preparing Gmail labels...")
@@ -83,7 +147,7 @@ def sync_inbox(*, analyze_new: bool = True, track_progress: bool = False) -> dic
         logger.warning("Label preparation failed: %s", exc)
         errors.append({"stage": "labels", "message": str(exc)})
 
-    progress(8, "fetch", "Searching inbox (last 30 days)...")
+    progress(8, "fetch", "Searching inbox (last 5 days)...")
 
     while fetched_count < SYNC_MAX_EMAILS:
         try:
@@ -117,6 +181,9 @@ def sync_inbox(*, analyze_new: bool = True, track_progress: bool = False) -> dic
             fetch_percent,
             "fetch",
             f"Fetching emails ({fetched_count} checked, {new_count} new)...",
+            checked=fetched_count,
+            new=new_count,
+            total_estimate=size_estimate,
         )
 
         page_token = result.get("next_page_token")
@@ -132,7 +199,12 @@ def sync_inbox(*, analyze_new: bool = True, track_progress: bool = False) -> dic
     analyzed = 0
     pending_total = storage.count_pending_emails() if analyze_new else 0
     if analyze_new:
-        progress(58, "analyze", f"Analyzing {pending_total} pending email(s)...")
+        progress(
+            58,
+            "analyze",
+            f"Analyzing {pending_total} pending email(s)...",
+            pending_total=pending_total,
+        )
         analyzed, analyze_errors = analyze_all_pending(
             track_progress=track_progress,
             total_pending=pending_total,
@@ -165,6 +237,7 @@ def sync_inbox(*, analyze_new: bool = True, track_progress: bool = False) -> dic
 
 
 def start_background_sync(*, analyze_new: bool = True) -> dict[str, Any]:
+    global _last_logged_stage, _last_logged_message, _last_logged_percent
     with _sync_lock:
         if _sync_state.get("active"):
             return {"started": False, "progress": dict(_sync_state)}
@@ -179,6 +252,10 @@ def start_background_sync(*, analyze_new: bool = True) -> dict[str, Any]:
                 "error": None,
             }
         )
+        # Reset throttle so the first progress line of this run is always logged.
+        _last_logged_stage = ""
+        _last_logged_message = ""
+        _last_logged_percent = -100
 
     thread = threading.Thread(target=_run_sync_job, args=(analyze_new,), daemon=True)
     thread.start()

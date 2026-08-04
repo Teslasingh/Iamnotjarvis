@@ -60,8 +60,8 @@ email_agent/
 ## Behavior
 
 - Resume upload supports PDF, DOCX, and text files. The app extracts resume text, builds structured profile data, saves it in SQLite under `resume_profiles`, and displays a natural-language profile summary.
-- Gmail access uses OAuth and the Gmail API only. The app always syncs `in:inbox newer_than:30d` and stores emails in SQLite.
-- On first open, all inbox mail from the last 30 days is fetched. On later opens, only new mail since the last saved email is synced.
+- Gmail access uses OAuth and the Gmail API only. The app always syncs `in:inbox newer_than:5d` and stores emails in SQLite.
+- On first open, all inbox mail from the last 5 days is fetched. On later opens, only new mail since the last saved email is synced.
 - Sync and AI analysis run automatically when you open the app (if Gmail is connected).
 - Email statuses are `Not Analyzed`, `Analyzing`, `Analyzed`, `Relevant`, and `Not Relevant`.
 - AI matching returns company, job title, job type, match score, confidence, required skills, matched skills, missing skills, summary, and explanation.
@@ -77,7 +77,7 @@ email_agent/
 
 1. Upload your resume and save your profile.
 2. Edit the **Agent Prompt** if needed, then click **Save Prompt**.
-3. Open the app — it auto-syncs your last 30 days of inbox mail. Use **Sync** anytime for a manual refresh.
+3. Open the app — it auto-syncs your last 5 days of inbox mail. Use **Sync** anytime for a manual refresh.
 4. Sort by recent mail, highest match %, or most relevant.
 5. Open an email to see AI confidence vs your profile, then generate a reply if needed.
 

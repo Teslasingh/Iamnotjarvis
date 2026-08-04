@@ -94,6 +94,20 @@ function renderSyncProgress(progress = {}) {
   percentLabel.textContent = `${percent}%`;
   if (stageLabel) stageLabel.textContent = formatSyncStage(progress.stage);
   if (message) message.textContent = progress.message || "Waiting to sync...";
+
+  const checked = Number(progress.checked || 0);
+  const newCount = Number(progress.new || 0);
+  const analyzed = Number(progress.analyzed || 0);
+  const pending = Number(progress.pending_total || 0);
+  const setStat = (id, value) => {
+    const el = $(id);
+    if (el) el.textContent = value;
+  };
+  setStat("#sync-stat-checked", checked);
+  setStat("#sync-stat-new", newCount);
+  setStat("#sync-stat-analyzed", analyzed);
+  setStat("#sync-stat-pending", pending);
+
   if (panel && (progress.active || percent > 0)) panel.open = true;
   if (panel && !progress.active && progress.stage === "done") {
     window.setTimeout(() => {
@@ -121,18 +135,20 @@ function renderSyncStatus(data) {
   if (!element) return;
 
   if (state.syncing) {
-    element.textContent = "Syncing Gmail inbox (last 30 days)...";
+    element.textContent = `Syncing Gmail inbox (last ${state.windowDays} days)...`;
     updateSyncButton();
     return;
   }
 
   const info = data?.sync_info || state.syncInfo || {};
   state.syncInfo = info;
+  const windowDays = info.window_days ?? state.windowDays ?? 5;
+  state.windowDays = windowDays;
   const total = info.total_in_db ?? 0;
   const pending = info.pending_analysis ?? 0;
   const lastSynced = formatDateTime(info.last_synced_at);
   const latestSubject = info.latest_email_subject || "No emails yet";
-  const mode = data?.mode === "incremental" ? "Checked for new mail" : "Loaded last 30 days";
+  const mode = data?.mode === "incremental" ? "Checked for new mail" : `Loaded last ${windowDays} days`;
 
   if (!state.gmailAuthorized) {
     element.textContent = "Connect Gmail to sync your inbox.";
@@ -188,6 +204,11 @@ async function loadStatus() {
   const data = await api("/api/status");
   state.gmailAuthorized = Boolean(data.gmail_authorized);
   state.syncInfo = data.sync_info || null;
+  state.windowDays = (data.sync_info && data.sync_info.window_days) || 5;
+  const hint = $("#sync-status");
+  if (hint && !state.syncing) {
+    hint.textContent = `Loading inbox from the last ${state.windowDays} days...`;
+  }
   $("#status").innerHTML = [
     ["Gmail", data.gmail_authorized ? `Connected as ${data.gmail_email}` : "Not connected"],
     ["OpenAI", data.openai_configured ? "Configured" : "Heuristic fallback"],
@@ -284,6 +305,74 @@ async function saveProfile(event) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+function openProfileModal() {
+  const form = $("#profile-modal-form");
+  for (const [key, value] of Object.entries(state.profile)) {
+    const field = form.elements[key];
+    if (field && field.type !== "file") {
+      field.value = typeof value === "object" ? "" : value || "";
+    }
+  }
+  renderSavedResumeInto($("#modal-saved-resume-info"), state.profile);
+  $("#profile-modal").classList.remove("hidden");
+}
+
+function closeProfileModal() {
+  $("#profile-modal").classList.add("hidden");
+}
+
+async function saveProfileModal(event) {
+  event.preventDefault();
+  const form = event.target;
+  const formData = new FormData(form);
+  const preserved = [
+    "phone",
+    "location",
+    "linkedin",
+    "portfolio",
+    "summary",
+    "work_experience",
+    "common_application_details",
+    "resume_notes",
+  ];
+  for (const key of preserved) {
+    if (state.profile[key]) {
+      formData.set(key, state.profile[key]);
+    }
+  }
+  const saveButton = $("#profile-modal-save");
+  saveButton.disabled = true;
+  saveButton.textContent = "Saving...";
+  try {
+    const profile = await api("/api/profile", { method: "POST", body: formData });
+    state.profile = profile;
+    renderSavedResume(profile);
+    toast("Profile saved and resume parsed.", "success");
+    await Promise.all([loadStatus(), loadProfile()]);
+    closeProfileModal();
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    saveButton.disabled = false;
+    saveButton.textContent = "Save Profile";
+  }
+}
+
+function renderSavedResumeInto(element, profile) {
+  if (!element) return;
+  const fileName = profile.resume_file_name || fileNameFromPath(profile.resume_path);
+  if (!profile.resume_uploaded && !fileName) {
+    element.innerHTML = `<div class="empty compact">No resume saved yet.</div>`;
+    return;
+  }
+  element.innerHTML = `
+    <div class="saved-resume-card">
+      <strong>Saved resume</strong>
+      <span>${escapeHtml(fileName || "resume")}</span>
+      <small>Upload a new file above to replace it.</small>
+    </div>`;
 }
 
 function renderSavedResume(profile) {
@@ -422,7 +511,7 @@ function renderEmailList() {
   }
   const emails = sortEmails(state.emails);
   if (!emails.length) {
-    list.innerHTML = `<div class="empty">No emails in the last 30 days yet.</div>`;
+    list.innerHTML = `<div class="empty">No emails in the last 5 days yet.</div>`;
     return;
   }
   list.innerHTML = emails
@@ -890,6 +979,16 @@ function escapeHtml(value) {
 }
 
 $("#profile-form").addEventListener("submit", saveProfile);
+$("#edit-profile-button").addEventListener("click", openProfileModal);
+$("#profile-modal-form").addEventListener("submit", saveProfileModal);
+document.querySelectorAll("[data-close='profile-modal']").forEach((el) => {
+  el.addEventListener("click", closeProfileModal);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("#profile-modal").classList.contains("hidden")) {
+    closeProfileModal();
+  }
+});
 $("#save-agent-prompt").addEventListener("click", saveAgentPrompt);
 $("#reset-agent-prompt").addEventListener("click", resetAgentPrompt);
 $("#sync-button").addEventListener("click", () => syncInbox());
